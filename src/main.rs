@@ -11,6 +11,7 @@ use anyhow::Result;
 use simplelog::*;
 use crate::algorithm::reverse_search;
 use log::{debug, info};
+use std::rc::Rc;
 
 pub mod algorithm;
 
@@ -29,12 +30,12 @@ struct Args {
 
 fn read_polytope(poly_str: String) -> serde_json::Result<Vec<FullPolytope>>{
     let deserialised: Vec<FullPolytope> = serde_json::from_str(&poly_str)?;
-    eprintln!("Loaded {} polytopes", deserialised.len());
+    info!("Loaded {} polytopes", deserialised.len());
     Ok(deserialised)
 }
 
 fn write_polytope(poly_str: &Vec<FullPolytope>, out_filename: &String) -> Result<()>{
-    eprintln!("Saving {} polytopes to {}", poly_str.len(), out_filename);
+    info!("Saving {} polytopes to {}", poly_str.len(), out_filename);
     let out_string = serde_json::to_string_pretty(poly_str)?;
     let poly_out_file = File::create(out_filename)?;
     let mut writer = BufWriter::new(poly_out_file);    
@@ -42,7 +43,7 @@ fn write_polytope(poly_str: &Vec<FullPolytope>, out_filename: &String) -> Result
     return Ok(());
 }
 
-fn write_search_results(states: &Vec<(ReverseSearchState, f64)>, out_filename: &String) -> Result<()>{
+fn write_search_results(states: &Vec<ReverseSearchState>, out_filename: &String) -> Result<()>{
     info!("Saving {} search results to {}", states.len(), out_filename);
     let out_string = serde_json::to_string_pretty(states)?;
     let states_out_file = File::create(out_filename)?;
@@ -58,7 +59,7 @@ fn main() -> Result<()>{
 
     let args = Args::parse();
 
-    eprintln!("Loading {}!", args.polytope_file);
+    info!("Loading {}!", args.polytope_file);
 
     let json_file = File::open(args.polytope_file)?;
     let mut buf_reader = BufReader::new(json_file);

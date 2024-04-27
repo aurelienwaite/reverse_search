@@ -7,17 +7,18 @@ use itertools::Itertools;
 use log::{debug, info};
 use ndarray::prelude::*;
 use ndarray_linalg::norm::normalize;
-use ndarray_linalg::NormalizeAxis;
+use ndarray_linalg::{Norm, NormalizeAxis};
 use ndarray_rand::rand_distr::num_traits::{float, zero};
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
 use ndarray_stats::{DeviationExt, QuantileExt};
 use serde::{Deserialize, Serialize};
 use serde_json::map::Iter;
+use std::borrow::BorrowMut;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::env::var;
 use std::io::{stdout, Error, Write};
-use std::ops::{Index, Sub};
+use std::ops::{Deref, DerefMut, Index, Sub};
 use std::os::macos::raw::stat;
 use std::rc::Rc;
 
@@ -38,6 +39,11 @@ enum EssentialSolution {
 enum AdjacencySolution {
     Adjacent(Array1<f64>), // Contains the certificate of the solution
     Infeasible,
+}
+
+enum SearchDirection {
+    Reverse,
+    Forward,
 }
 
 fn inner_product_lp(coefficients: &Vector, variables: &[good_lp::Variable]) -> Expression {
@@ -106,11 +112,11 @@ fn lp_separation(
 fn lp_normal_cone(edges: &Array2<f64>) -> Result<Array1<f64>> {
     let mut vars = variables!();
     let num_edges = edges.shape()[0];
-    let ones: Array2<f64> = Array2::ones((num_edges, 1));
+    let ones: Array2<f64> = -1. * Array2::ones((num_edges, 1));
     let constraints = ndarray::concatenate(Axis(1), &[ones.view(), edges.view()])?;
     let dim = constraints.shape()[1];
-    let mut x: Vec<good_lp::Variable> = Vec::with_capacity(dim + 1);
-    for _i in 0..dim + 1 {
+    let mut x: Vec<good_lp::Variable> = Vec::with_capacity(dim);
+    for _i in 0..dim {
         x.push(vars.add_variable());
     }
 
@@ -119,22 +125,29 @@ fn lp_normal_cone(edges: &Array2<f64>) -> Result<Array1<f64>> {
     for edge in constraints.axis_iter(Axis(0)) {
         let constraint = inner_product_lp_ndarray(&edge, &x);
         // Copied from CDD, I think the 1 is to ensure that the point is interior
-        problem = problem.with(constraint!(constraint <= 1.));
+        problem = problem.with(constraint!(constraint >= 1.));
     }
     // To be honest, I'm not completely sure why this is needed. I think
     // it's to keep the solution bounded but using a 2 is a bit arbitrary.
     problem = problem.with(constraint!(*objective <= 2.));
 
     let solution = problem.solve()?;
-    let maximiser = x.iter().map(|v| solution.value(*v)).collect::<Vec<_>>();
+    debug!("x: {}", solution.value(*objective));
+    debug_assert!(solution.value(*objective) > EPSILON);
+    let maximiser = x[1..]
+        .iter()
+        .map(|v| solution.value(*v))
+        .collect::<Vec<_>>();
     return Ok(arr1(&maximiser));
 }
 
 // Identifies whether an edge identifies a boundary to an adjacent cone
 fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<AdjacencySolution> {
+    debug!("Test edge {}", to_test);
     let test_vec = edges
         .select(Axis(0), &[to_test])
         .into_shape(edges.shape()[1])?;
+    let objective_vec = -1. * &test_vec;
 
     let dim = edges.shape()[1];
     let mut vars = variables!();
@@ -142,22 +155,25 @@ fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<AdjacencySolution
     for _i in 0..dim {
         x.push(vars.add_variable());
     }
-    let objective = inner_product_lp_ndarray(&test_vec.view(), &x);
-    let mut problem = vars.maximise(objective.clone()).using(default_solver);
+    let objective = inner_product_lp_ndarray(&objective_vec.view(), &x);
+    let mut problem = vars.maximise(objective).using(default_solver);
     // Minksum adds a 1 to the objective and adds it as constraint. Assuming that this
     // is a bounding constraint and reproducing here.
-    let bounding_constraint = objective.clone() * -1;
-    problem = problem.with(constraint!(bounding_constraint <= 1.));
+    let bounding_constraint = inner_product_lp_ndarray(&test_vec.view(), &x);
+    problem = problem.with(constraint!(bounding_constraint <= EPSILON));
 
-    // The edges have been normalised, making it easy to test for parallism
-    let parallel = test_vec.dot(edges).map(|d| (d.abs() - 1.).abs() < EPSILON);
+    // The edges have been normalised, making it easy to test for parallelism
+    let parallel = test_vec
+        .dot(&edges.t())
+        .map(|d| (d.abs() - 1.).abs() < EPSILON);
     for (i, (edge, is_parallel)) in edges.axis_iter(Axis(0)).zip(parallel).enumerate() {
         // Don't add parallel edges. This is different to the minksum
         // implementation that returns false if the polytope or neighbour
         // is indexed lower than the given indices.
-        if !is_parallel || i == to_test {
+        if !is_parallel {
+            debug!("Adding edge {}", i);
             let constraint = inner_product_lp_ndarray(&edge, &x);
-            problem = problem.with(constraint!(constraint <= 0.));
+            problem = problem.with(constraint!(constraint >= 0.));
         }
     }
     let solution = problem.solve()?;
@@ -166,7 +182,12 @@ fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<AdjacencySolution
         .map(|v| solution.value(*v))
         .collect::<Vec<_>>()
         .into();
-    let result = if cert.dot(&test_vec) > EPSILON {
+    let score = cert.dot(&test_vec);
+    debug!("Adjacency test score {}", score);
+    for (i, edge) in edges.axis_iter(Axis(0)).enumerate() {
+        debug!("Adjacency score {} {}", i, cert.dot(&edge));
+    }
+    let result = if score > EPSILON {
         AdjacencySolution::Adjacent(cert)
     } else {
         AdjacencySolution::Infeasible
@@ -252,23 +273,39 @@ impl Polytope {
             .filter(|(first, _)| *first == vertex)
             .collect::<Vec<_>>()
     }
+
+    fn neighbouring_edges<'a>(
+        self: &'a Polytope,
+        vertex: usize,
+    ) -> Box<dyn Iterator<Item = (&(usize, usize), ArrayView1<f64>)> + 'a> {
+        let iterator = self
+            .adjacency
+            .iter()
+            .zip_eq(self.edges.axis_iter(Axis(0)))
+            .filter(move |tup| tup.0 .0 == vertex);
+        return Box::new(iterator);
+    }
+
+    fn maximised_vertex(self: &Polytope, param: &Array1<f64>) -> Result<usize> {
+        return Ok(param.dot(&self.vertices).argmax()?);
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ReverseSearchState {
     param: Array1<f64>,
-    max_vertices: Vec<usize>, 
+    minkowski_decomp: Vec<usize>,
     neighbour_index: usize,
     polytope_index: usize,
 }
 
-impl ReverseSearchState{
-
+impl ReverseSearchState {
     fn vertex(self: &ReverseSearchState) -> usize {
-        return self.max_vertices[self.polytope_index];
+        return self.minkowski_decomp[self.polytope_index];
     }
 }
 
+#[derive(Debug)]
 struct AdjacencyTuple {
     polytope_index: usize,
     vertex: usize,
@@ -337,8 +374,8 @@ impl FullPolytope {
             let mut flattened_adjacency: Vec<(usize, usize)> = Vec::new();
             for (current_vertex, neighbours) in adjacency {
                 for neighbour in neighbours {
-                    let edge = &vertices.index_axis(Axis(1), neighbour)
-                        - &vertices.index_axis(Axis(1), current_vertex);
+                    let edge = &vertices.index_axis(Axis(1), current_vertex)
+                        - &vertices.index_axis(Axis(1), neighbour);
                     edges.push(edge);
                     flattened_adjacency.push((current_vertex, neighbour));
                 }
@@ -385,7 +422,7 @@ fn inc_mink_sum_setup(
 
     let mut state: ReverseSearchState = ReverseSearchState {
         param: Array1::ones(dim),
-        max_vertices: Vec::with_capacity(poly_list.as_ref().len()),
+        minkowski_decomp: Vec::with_capacity(poly_list.as_ref().len()),
         polytope_index: 0,
         neighbour_index: 0,
     };
@@ -427,10 +464,10 @@ fn inc_mink_sum_setup(
     }
     let max_vertices = essential_polys
         .iter()
-        .map(|p| state.param.dot(&p.vertices).argmin())
+        .map(|p| state.param.dot(&p.vertices).argmax())
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    state.max_vertices = max_vertices;
-    debug!("Max vertices {:?}", &state.max_vertices);
+    state.minkowski_decomp = max_vertices;
+    debug!("Minkowski decomposition {:?}", &state.minkowski_decomp);
     info!("Setup done");
     return Ok((essential_polys, state));
 }
@@ -438,67 +475,83 @@ fn inc_mink_sum_setup(
 // Find the parent of a cone. We shoot a ray towards the initial
 // cone, and the first hyperplane intersected by the ray is the
 // boundary to the parent cone.
-// Edges should be normalised, although normalising isn't done in
-// CDD code
+// Following CDD convention, the interior point should have a 1 as its
+// first element, and the direction a 0. However, because all the edges
+// have no offset we can ignore the first element.
+//
 fn parent(
     edges: &Array2<f64>,
     interior_point: &Array1<f64>,
-    direction: &Array1<f64>,
+    initial_point: &Array1<f64>,
 ) -> Result<usize> {
     debug_assert!(interior_point.len() > 0);
-    debug_assert_eq!(interior_point.len(), direction.len());
-    debug_assert_eq!(
-        *interior_point.first().unwrap(),
-        1_f64,
-        "Points should start with a 1 to store offsets"
-    );
-    debug_assert_eq!(
-        *direction.first().unwrap(),
-        0_f64,
-        "Directions are rays and should start with a 0"
-    );
+    debug_assert_eq!(interior_point.len(), initial_point.len());
+    let direction = interior_point - initial_point;
 
-    let inner_product_point = interior_point.dot(edges);
-    let inner_product_direction = direction.dot(edges);
-    let alpha = inner_product_direction / inner_product_point;
+    let edge_t = edges.t();
+    let inner_product_point = interior_point.dot(&edge_t);
+    let inner_product_direction = direction.dot(&edge_t);
+    debug!(
+        "Inner product point {}\n Inner product direction {}",
+        inner_product_point, inner_product_direction
+    );
+    let mut alpha = &inner_product_direction / &inner_product_point;
+    alpha.map_inplace(|a| {
+        if *a < 0. {
+            *a = f64::INFINITY
+        }
+    });
     let parent = alpha.argmin()?;
+    debug!("Parent index {}", parent);
+    debug!("Alpha {:?}", &alpha);
+    let min = alpha[parent];
+    debug!(
+        "Min {}, min IP {}, min dir {}",
+        min, inner_product_point[parent], inner_product_direction[parent]
+    );
     debug_assert_eq!(
-        alpha.count_eq(&array![*alpha.get(parent).unwrap()])?,
+        alpha.iter().filter(|a| (*a - min).abs() < EPSILON).count(),
         1,
         "Found ties when searching for a parent"
     );
-    let min_index = alpha.argmin()?;
-    return Ok(min_index);
+    return Ok(parent);
 }
 
-pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<Rc<ReverseSearchState>>> {
+pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearchState>> {
     let (polys, initial_state) = inc_mink_sum_setup(poly_list)?;
-    let initial_state_ref = Rc::new(initial_state);
+    let initial_state = initial_state;
     let num_edges: usize = polys.iter().map(|p| p.edges.len()).sum();
+    info!("Total edges: {}", num_edges);
     // Allocate these arrays in advance
     let mut edges: Vec<ArrayView2<f64>> = Vec::with_capacity(num_edges);
     let mut edge_indices: Vec<AdjacencyTuple> = Vec::with_capacity(num_edges);
 
-    let mut stack: Vec<Rc<ReverseSearchState>> = Vec::new();
-    stack.push(initial_state_ref.clone());
+    let mut stack: Vec<ReverseSearchState> = Vec::new();
+    stack.push(initial_state.clone());
 
-    let mut res: Vec<Rc<ReverseSearchState>> = Vec::new();
+    let mut res: Vec<ReverseSearchState> = Vec::new();
 
     while !stack.is_empty() {
-        if res.len() >= 10{ //Delete this!
+        if res.len() >= 10 {
+            info!("10 results found. Breaking");
             break;
         }
-        let prev_state = stack
+        let mut state = stack
             .pop()
             .ok_or(anyhow!("Empty stack! This should never happen"))?;
-        let mut state = (*prev_state).clone();
+        debug!(
+            "Starting state: polytope {} vertex {} neighbour counter {}",
+            state.polytope_index,
+            state.vertex(),
+            state.neighbour_index
+        );
         edges.clear();
-        edge_indices.clear();
 
         let mut polytope = &polys[state.polytope_index];
         let mut vertex = state.vertex();
-        state.neighbour_index += 1;
+
         let mut neighbours = polytope.neighbours(vertex);
+        state.neighbour_index += 1;
         if state.neighbour_index >= neighbours.len() {
             state.polytope_index += 1;
             if state.polytope_index >= polys.len() {
@@ -511,62 +564,134 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<Rc<ReverseSe
             neighbours = polytope.neighbours(vertex);
         }
 
-        state.max_vertices[state.polytope_index] = neighbours[state.neighbour_index].1;
+        let test_vertex = neighbours[state.neighbour_index].1;
 
         let mut test_edge: Option<(usize, ArrayView1<f64>)> = None;
         let mut edge_counter: usize = 0;
         for (inner_polytope_index, (poly, inner_vertex)) in
-            polys.iter().zip(&state.max_vertices).enumerate()
+            polys.iter().zip(&state.minkowski_decomp).enumerate()
         {
-            for (index, edge) in poly.adjacency.iter().zip_eq(poly.edges.axis_iter(Axis(0))) {
-                if inner_polytope_index == state.polytope_index
-                    && vertex == index.0
-                    && *inner_vertex == index.1
-                {
+            for (index, edge) in poly.neighbouring_edges(*inner_vertex) {
+                if inner_polytope_index == state.polytope_index && test_vertex == index.1 {
                     test_edge = Some((edge_counter, edge));
                 }
                 edges.push(edge.into_shape((1, edge.shape()[0]))?);
-                edge_indices.push(AdjacencyTuple {
-                    polytope_index: inner_polytope_index,
-                    vertex: index.0,
-                    neighbour: index.1,
-                });
                 edge_counter += 1;
             }
         }
-        info!("edges len {} ", edges.len());
         let (test_edge_index, test_edge) = test_edge.ok_or(anyhow!("No edge found!"))?;
+        debug!("edges len {}", edges.len());
         // Test if edge is leaving objective
         let score = state.param.dot(&test_edge);
         if score < -1. * EPSILON {
-            stack.push(prev_state);
-            continue;  
-        }
-
-
-        let edge_array: Array2<f64> = ndarray::concatenate(Axis(0), &edges)?;
-
-        let is_adjacent =
-            match lp_adjacency(&edge_array,  test_edge_index)?{
-                AdjacencySolution::Adjacent(_cert) => true,
-                AdjacencySolution::Infeasible => false,
-            };
-        if !is_adjacent {
-            stack.push(prev_state);
+            debug!(
+                "Skipping because edge is not leading away from objective. Score: {}",
+                score
+            );
+            stack.push(state);
             continue;
         }
 
-        let maximiser = lp_normal_cone(&edge_array)?;
-        debug_assert!(maximiser.dot(&test_edge) > EPSILON, "Because we have tested for adjacency, we should always get a maximiser");
-        
-        let parent_edge = parent(&edge_array, &maximiser, &initial_state_ref.param)?;
-        let parent = edge_indices[parent_edge].neighbour;
-        if parent == state.max_vertices[state.polytope_index]{
-            let state_ref = Rc::new(state);
-            stack.push(state_ref);
-            res.push(state_ref);
-        }else{
-            stack.push(prev_state);
+        let edge_array: Array2<f64> = ndarray::concatenate(Axis(0), &edges)?;
+
+        let is_adjacent = match lp_adjacency(&edge_array, test_edge_index)? {
+            AdjacencySolution::Adjacent(_cert) => true,
+            AdjacencySolution::Infeasible => false,
+        };
+        if !is_adjacent {
+            debug!("Skipping because edge is not adjacent");
+            stack.push(state);
+            continue;
+        }
+
+        let mut test_decomp = state.minkowski_decomp.clone();
+        test_decomp[state.polytope_index] = neighbours[state.neighbour_index].1;
+        debug!("Test decomposition {:?}", &test_decomp);
+
+        //rebuild edges for new cone
+        edges.clear();
+        edge_indices.clear();
+        for (inner_polytope_index, (poly, inner_vertex)) in
+            polys.iter().zip(&test_decomp).enumerate()
+        {
+            debug!(
+                "Poly index {}, inner vertex {}, neighbours {:?}",
+                inner_polytope_index,
+                inner_vertex,
+                poly.neighbours(*inner_vertex)
+            );
+            for (adj, edge) in poly.neighbouring_edges(*inner_vertex) {
+                edges.push(edge.into_shape((1, edge.shape()[0]))?);
+                edge_indices.push(AdjacencyTuple {
+                    polytope_index: inner_polytope_index,
+                    vertex: adj.0,
+                    neighbour: adj.1,
+                });
+            }
+        }
+        debug_assert_eq!(edges.len(), edge_indices.len());
+        let test_edges_array: Array2<f64> = ndarray::concatenate(Axis(0), &edges)?;
+
+        let maximiser = lp_normal_cone(&test_edges_array)?;
+        let maximiser_norm = &maximiser / maximiser.norm();
+        debug!("Maximiser: {:?}", maximiser_norm);
+        fn test_edges(edges: &Array2<f64>, maximiser: &Array1<f64>) -> Result<bool> {
+            let scores = maximiser.dot(&edges.t()).map(|score| *score > EPSILON);
+            let test = scores.iter().map(|t| *t).reduce(|acc, test| acc && test);
+            return test.ok_or(anyhow!("No scores! - edge array must be empty"));
+        }
+
+        fn test_maximiser(
+            polys: &[Polytope],
+            decomp: &[usize],
+            maximiser: &Array1<f64>,
+        ) -> Result<bool> {
+            let maximised = polys
+                .iter()
+                .map(|p| p.maximised_vertex(maximiser))
+                .collect::<Result<Vec<_>>>()?;
+            let equal_decomp = maximised
+                .iter()
+                .zip(decomp)
+                .map(|(left, right)| *left == *right)
+                .reduce(|accm, test| accm && test)
+                .ok_or(anyhow!("Empty decomp!"))?;
+            return Ok(equal_decomp);
+        }
+
+        debug_assert!(
+            test_edges(&test_edges_array, &maximiser_norm)?,
+            "Because we have tested for adjacency, we should always get a maximiser"
+        );
+
+        debug_assert!(
+            test_maximiser(&polys, &test_decomp, &maximiser_norm)?,
+            "Maximiser does not retrieve the decomposition"
+        );
+
+        let parent_edge = parent(&test_edges_array, &maximiser_norm, &initial_state.param)?;
+        let parent_edge_index = &edge_indices[parent_edge];
+        debug!("Parent edge {:?}", parent_edge_index);
+        let mut parent = test_decomp.clone();
+        parent[parent_edge_index.polytope_index] = parent_edge_index.neighbour;
+
+        debug!("Parent decomp: {:?}", &parent);
+        debug!("  Test decomp: {:?}", &test_decomp);
+        debug!(" State decomp: {:?}", &state.minkowski_decomp);
+        if parent == state.minkowski_decomp {
+            // Need to test rust vec equality
+            debug!("Reverse step");
+            let child_state = ReverseSearchState {
+                polytope_index: 0,
+                neighbour_index: 0,
+                param: maximiser_norm,
+                minkowski_decomp: test_decomp,
+            };
+            res.push(child_state.clone());
+            stack.push(state);
+            stack.push(child_state);
+        } else {
+            stack.push(state);
         }
     }
     return Ok(res);
