@@ -3,9 +3,9 @@ use good_lp::{
     constraint, default_solver, variables, Expression, ResolutionError, Solution, SolverModel,
 };
 
-use itertools::Itertools;
+use itertools::{put_back, Itertools};
 use log::{debug, info};
-use ndarray::prelude::*;
+use ndarray::{concatenate, prelude::*};
 use ndarray_linalg::norm::normalize;
 use ndarray_linalg::{Norm, NormalizeAxis};
 use ndarray_rand::rand_distr::num_traits::{float, zero};
@@ -36,14 +36,9 @@ enum EssentialSolution {
     Redundant,
 }
 
-enum AdjacencySolution {
-    Adjacent(Array1<f64>), // Contains the certificate of the solution
+enum InteriorPointSolution {
+    Feasible(Array1<f64>), // Contains the certificate of the solution
     Infeasible,
-}
-
-enum SearchDirection {
-    Reverse,
-    Forward,
 }
 
 fn inner_product_lp(coefficients: &Vector, variables: &[good_lp::Variable]) -> Expression {
@@ -108,12 +103,16 @@ fn lp_separation(
     return Ok(sep_solution);
 }
 
-// Finds a maximiser for a normal cone
-fn lp_normal_cone(edges: &Array2<f64>) -> Result<Array1<f64>> {
+// Shamelessly copied from CDD for LP feasibility problems
+fn lp_interior_point(
+    matrix_a: &Array2<f64>,
+    vector_b: &Array1<f64>,
+) -> Result<InteriorPointSolution> {
+    debug_assert_eq!(matrix_a.shape()[0], vector_b.shape()[0]);
     let mut vars = variables!();
-    let num_edges = edges.shape()[0];
-    let ones: Array2<f64> = -1. * Array2::ones((num_edges, 1));
-    let constraints = ndarray::concatenate(Axis(1), &[ones.view(), edges.view()])?;
+    let num_rows = matrix_a.shape()[0];
+    let ones: Array2<f64> = Array2::ones((num_rows, 1));
+    let constraints = ndarray::concatenate(Axis(1), &[ones.view(), matrix_a.view()])?;
     let dim = constraints.shape()[1];
     let mut x: Vec<good_lp::Variable> = Vec::with_capacity(dim);
     for _i in 0..dim {
@@ -122,33 +121,50 @@ fn lp_normal_cone(edges: &Array2<f64>) -> Result<Array1<f64>> {
 
     let objective = x.first().ok_or(anyhow!("No variables!"))?;
     let mut problem = vars.maximise(objective).using(default_solver);
-    for edge in constraints.axis_iter(Axis(0)) {
-        let constraint = inner_product_lp_ndarray(&edge, &x);
-        // Copied from CDD, I think the 1 is to ensure that the point is interior
-        problem = problem.with(constraint!(constraint >= 1.));
+    for (row, b_val) in constraints.axis_iter(Axis(0)).zip_eq(vector_b) {
+        let constraint = inner_product_lp_ndarray(&row, &x);
+        problem = problem.with(constraint!(constraint <= *b_val));
     }
+
     // To be honest, I'm not completely sure why this is needed. I think
     // it's to keep the solution bounded but using a 2 is a bit arbitrary.
-    problem = problem.with(constraint!(*objective <= 2.));
+    let b_ceil = 1f64.max(*vector_b.max()?) * 2.;
+    problem = problem.with(constraint!(*objective <= b_ceil));
 
     let solution = problem.solve()?;
     debug!("x: {}", solution.value(*objective));
-    debug_assert!(solution.value(*objective) > EPSILON);
+    if solution.value(*objective) < EPSILON {
+        return Ok(InteriorPointSolution::Infeasible);
+    }
     let maximiser = x[1..]
         .iter()
         .map(|v| solution.value(*v))
         .collect::<Vec<_>>();
-    return Ok(arr1(&maximiser));
+    return Ok(InteriorPointSolution::Feasible(arr1(&maximiser)));
+}
+
+// Finds a maximiser for a normal cone
+fn lp_normal_cone(edges: &Array2<f64>) -> Result<Array1<f64>> {
+    // Copied from CDD, I think the 1 is to ensure that the point is interior
+    let vector_b: Array1<f64> = Array1::ones(edges.shape()[0]);
+    let solution = lp_interior_point(&(-1.0 * edges), &vector_b)?;
+    let res = match solution {
+        InteriorPointSolution::Feasible(cert) => Ok(cert),
+        InteriorPointSolution::Infeasible =>Result::Err(anyhow!("We should always get a feasible solution because the adjacency oracle will return feasible cones"))
+    };
+    return res;
 }
 
 // Identifies whether an edge identifies a boundary to an adjacent cone
-fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<AdjacencySolution> {
+fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<InteriorPointSolution> {
     debug!("Test edge {}", to_test);
+    let dim = edges.shape()[1];
     let test_vec = edges
         .select(Axis(0), &[to_test])
         .into_shape(edges.shape()[1])?;
-    let objective_vec = -1. * &test_vec;
+    let objective_vec = &test_vec * 1.;
 
+    /*
     let dim = edges.shape()[1];
     let mut vars = variables!();
     let mut x: Vec<good_lp::Variable> = Vec::with_capacity(dim);
@@ -159,8 +175,8 @@ fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<AdjacencySolution
     let mut problem = vars.maximise(objective).using(default_solver);
     // Minksum adds a 1 to the objective and adds it as constraint. Assuming that this
     // is a bounding constraint and reproducing here.
-    let bounding_constraint = inner_product_lp_ndarray(&test_vec.view(), &x);
-    problem = problem.with(constraint!(bounding_constraint <= EPSILON));
+    //let bounding_constraint = inner_product_lp_ndarray(&(&test_vec * -1.0).view(), &x);
+    //problem = problem.with(constraint!(bounding_constraint <= 1.));
 
     // The edges have been normalised, making it easy to test for parallelism
     let parallel = test_vec
@@ -172,25 +188,51 @@ fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<AdjacencySolution
         // is indexed lower than the given indices.
         if !is_parallel {
             debug!("Adding edge {}", i);
-            let constraint = inner_product_lp_ndarray(&edge, &x);
-            problem = problem.with(constraint!(constraint >= 0.));
+            let constraint = inner_product_lp_ndarray(&(&edge * -1.0).view(), &x);
+            problem = problem.with(constraint!(constraint <= 0.));
         }
     }
+
     let solution = problem.solve()?;
-    let cert: Array1<f64> = x
-        .iter()
-        .map(|v| solution.value(*v))
-        .collect::<Vec<_>>()
-        .into();
-    let score = cert.dot(&test_vec);
-    debug!("Adjacency test score {}", score);
-    for (i, edge) in edges.axis_iter(Axis(0)).enumerate() {
-        debug!("Adjacency score {} {}", i, cert.dot(&edge));
-    }
-    let result = if score > EPSILON {
-        AdjacencySolution::Adjacent(cert)
-    } else {
-        AdjacencySolution::Infeasible
+    */
+
+    // The edges have been normalised, making it easy to test for parallelism
+    let parallel = test_vec
+        .dot(&edges.t())
+        .map(|d| (d.abs() - 1.).abs() < EPSILON);
+    let negated = -1. * edges;
+    let edges_view = negated.view();
+    let mut filtered = edges_view
+        .axis_iter(Axis(0))
+        .zip(parallel)
+        .filter_map(|(e, is_parallel)| {
+            if is_parallel {
+                None
+            } else {
+                Some(e.into_shape((1, dim)))
+            }
+        })
+        .collect::<core::result::Result<Vec<_>, _>>()?;
+    filtered.push(objective_vec.view().into_shape((1, dim))?);
+    let filtered_array = concatenate(Axis(0), &filtered)?;
+    debug!("Filtered length {}", filtered.len());
+    let vector_b = Array1::zeros(filtered.len());
+    let solution = lp_interior_point(&filtered_array, &vector_b)?;
+    let result = match solution{
+        InteriorPointSolution::Feasible(cert) => {
+            debug!("Cert {}", cert);
+            let score = cert.dot(&test_vec);
+            debug!("Adjacency test score {}", score);
+            for (i, edge) in edges.axis_iter(Axis(0)).enumerate() {
+                debug!("Adjacency score {} {}", i, cert.dot(&edge));
+            }
+            if score < EPSILON {
+                InteriorPointSolution::Feasible(cert)    
+            } else{
+                InteriorPointSolution::Infeasible
+            }
+        }
+        InteriorPointSolution::Infeasible => InteriorPointSolution::Infeasible
     };
     return Ok(result);
 }
@@ -595,8 +637,8 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
         let edge_array: Array2<f64> = ndarray::concatenate(Axis(0), &edges)?;
 
         let is_adjacent = match lp_adjacency(&edge_array, test_edge_index)? {
-            AdjacencySolution::Adjacent(_cert) => true,
-            AdjacencySolution::Infeasible => false,
+            InteriorPointSolution::Feasible(_cert) => true,
+            InteriorPointSolution::Infeasible => false,
         };
         if !is_adjacent {
             debug!("Skipping because edge is not adjacent");
