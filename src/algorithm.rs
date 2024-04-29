@@ -200,6 +200,7 @@ fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<InteriorPointSolu
     let parallel = test_vec
         .dot(&edges.t())
         .map(|d| (d.abs() - 1.).abs() < EPSILON);
+    debug!("Parallel {:?}", test_vec.dot(&edges.t()).iter().enumerate().collect::<Vec<_>>());
     let negated = -1. * edges;
     let edges_view = negated.view();
     let mut filtered = edges_view
@@ -324,7 +325,7 @@ impl Polytope {
             .adjacency
             .iter()
             .zip_eq(self.edges.axis_iter(Axis(0)))
-            .filter(move |tup| tup.0 .0 == vertex);
+            .filter(move |tup| tup.0.0 == vertex);
         return Box::new(iterator);
     }
 
@@ -414,6 +415,7 @@ impl FullPolytope {
         let poly: Option<Result<Polytope>> = essential.map(|(vertices, adjacency)| {
             let mut edges: Vec<Array1<f64>> = Vec::new();
             let mut flattened_adjacency: Vec<(usize, usize)> = Vec::new();
+            debug!("Vertices shape {:?}", vertices.shape());
             for (current_vertex, neighbours) in adjacency {
                 for neighbour in neighbours {
                     let edge = &vertices.index_axis(Axis(1), current_vertex)
@@ -529,21 +531,20 @@ fn parent(
     debug_assert!(interior_point.len() > 0);
     debug_assert_eq!(interior_point.len(), initial_point.len());
     let direction = interior_point - initial_point;
-
     let edge_t = edges.t();
     let inner_product_point = interior_point.dot(&edge_t);
     let inner_product_direction = direction.dot(&edge_t);
     debug!(
-        "Inner product point {}\n Inner product direction {}",
-        inner_product_point, inner_product_direction
+        "Inner product point {:?}\n Inner product direction {:?}",
+        inner_product_point.iter().enumerate().collect::<Vec<_>>(), inner_product_direction.iter().enumerate().collect::<Vec<_>>()
     );
     let mut alpha = &inner_product_direction / &inner_product_point;
-    alpha.map_inplace(|a| {
+    /*alpha.map_inplace(|a| {
         if *a < 0. {
-            *a = f64::INFINITY
+            *a = f64::NEG_INFINITY
         }
-    });
-    let parent = alpha.argmin()?;
+    });*/
+    let parent = alpha.argmax()?;
     debug!("Parent index {}", parent);
     debug!("Alpha {:?}", &alpha);
     let min = alpha[parent];
@@ -664,6 +665,7 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
             );
             for (adj, edge) in poly.neighbouring_edges(*inner_vertex) {
                 edges.push(edge.into_shape((1, edge.shape()[0]))?);
+                debug!("Double check indices {} {} {}", inner_polytope_index, adj.0, adj.1);
                 edge_indices.push(AdjacencyTuple {
                     polytope_index: inner_polytope_index,
                     vertex: adj.0,
@@ -672,6 +674,7 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
             }
         }
         debug_assert_eq!(edges.len(), edge_indices.len());
+        debug!("Edge indices {:?}", edge_indices.iter().enumerate().collect::<Vec<_>>());
         let test_edges_array: Array2<f64> = ndarray::concatenate(Axis(0), &edges)?;
 
         let maximiser = lp_normal_cone(&test_edges_array)?;
@@ -694,7 +697,7 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
                 .collect::<Result<Vec<_>>>()?;
             let equal_decomp = maximised
                 .iter()
-                .zip(decomp)
+                .zip_eq(decomp)
                 .map(|(left, right)| *left == *right)
                 .reduce(|accm, test| accm && test)
                 .ok_or(anyhow!("Empty decomp!"))?;
