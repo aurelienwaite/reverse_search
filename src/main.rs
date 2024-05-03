@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::io::prelude::*;
 use std::io::BufWriter;
-use algorithm::ReverseSearchState;
+use algorithm::ReverseSearchOut;
 use clap::Parser;
 use std::vec::Vec;
 use std::string::String;
@@ -43,7 +43,7 @@ fn write_polytope(poly_str: &Vec<FullPolytope>, out_filename: &String) -> Result
     return Ok(());
 }
 
-fn write_search_results(states: &Vec<ReverseSearchState>, out_filename: &String) -> Result<()>{
+fn write_search_results(states: &Vec<ReverseSearchOut>, out_filename: &String) -> Result<()>{
     info!("Saving {} search results to {}", states.len(), out_filename);
     let out_string = serde_json::to_string_pretty(states)?;
     let states_out_file = File::create(out_filename)?;

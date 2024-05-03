@@ -3,24 +3,20 @@ use good_lp::{
     constraint, default_solver, variables, Expression, ResolutionError, Solution, SolverModel,
 };
 
-use itertools::{put_back, Itertools};
+use itertools::Itertools;
 use log::{debug, info};
 use ndarray::{concatenate, prelude::*};
 use ndarray_linalg::norm::normalize;
 use ndarray_linalg::{Norm, NormalizeAxis};
-use ndarray_rand::rand_distr::num_traits::{float, zero};
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
-use ndarray_stats::{DeviationExt, QuantileExt};
+use ndarray_stats::QuantileExt;
 use serde::{Deserialize, Serialize};
-use serde_json::map::Iter;
-use std::borrow::BorrowMut;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::env::var;
-use std::io::{stdout, Error, Write};
-use std::ops::{Deref, DerefMut, Index, Sub};
-use std::os::macos::raw::stat;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Write;
 use std::rc::Rc;
+use std::usize;
 
 type Vector = [f64];
 type Matrix = Vec<Rc<Vector>>;
@@ -81,7 +77,7 @@ fn lp_separation(
     let mut problem = vars
         .maximise(&objective)
         .using(default_solver)
-        .with(constraint!(d + inner_product_lp(&to_test, &x) <= 1));
+        .with(constraint!(d + inner_product_lp(&to_test, &x) <= 1.));
 
     for vertex in vertices {
         problem = problem.with(constraint!(d + inner_product_lp(&vertex, &x) <= 0.));
@@ -123,7 +119,7 @@ fn lp_interior_point(
     let mut problem = vars.maximise(objective).using(default_solver);
     for (row, b_val) in constraints.axis_iter(Axis(0)).zip_eq(vector_b) {
         let constraint = inner_product_lp_ndarray(&row, &x);
-        problem = problem.with(constraint!(constraint <= *b_val));
+        problem = problem.with(constraint!(constraint <= (*b_val - EPSILON)));
     }
 
     // To be honest, I'm not completely sure why this is needed. I think
@@ -132,7 +128,6 @@ fn lp_interior_point(
     problem = problem.with(constraint!(*objective <= b_ceil));
 
     let solution = problem.solve()?;
-    debug!("x: {}", solution.value(*objective));
     if solution.value(*objective) < EPSILON {
         return Ok(InteriorPointSolution::Infeasible);
     }
@@ -157,7 +152,6 @@ fn lp_normal_cone(edges: &Array2<f64>) -> Result<Array1<f64>> {
 
 // Identifies whether an edge identifies a boundary to an adjacent cone
 fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<InteriorPointSolution> {
-    debug!("Test edge {}", to_test);
     let dim = edges.shape()[1];
     let test_vec = edges
         .select(Axis(0), &[to_test])
@@ -200,7 +194,6 @@ fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<InteriorPointSolu
     let parallel = test_vec
         .dot(&edges.t())
         .map(|d| (d.abs() - 1.).abs() < EPSILON);
-    debug!("Parallel {:?}", test_vec.dot(&edges.t()).iter().enumerate().collect::<Vec<_>>());
     let negated = -1. * edges;
     let edges_view = negated.view();
     let mut filtered = edges_view
@@ -216,24 +209,18 @@ fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<InteriorPointSolu
         .collect::<core::result::Result<Vec<_>, _>>()?;
     filtered.push(objective_vec.view().into_shape((1, dim))?);
     let filtered_array = concatenate(Axis(0), &filtered)?;
-    debug!("Filtered length {}", filtered.len());
     let vector_b = Array1::zeros(filtered.len());
     let solution = lp_interior_point(&filtered_array, &vector_b)?;
-    let result = match solution{
+    let result = match solution {
         InteriorPointSolution::Feasible(cert) => {
-            debug!("Cert {}", cert);
             let score = cert.dot(&test_vec);
-            debug!("Adjacency test score {}", score);
-            for (i, edge) in edges.axis_iter(Axis(0)).enumerate() {
-                debug!("Adjacency score {} {}", i, cert.dot(&edge));
-            }
             if score < EPSILON {
-                InteriorPointSolution::Feasible(cert)    
-            } else{
+                InteriorPointSolution::Feasible(cert)
+            } else {
                 InteriorPointSolution::Infeasible
             }
         }
-        InteriorPointSolution::Infeasible => InteriorPointSolution::Infeasible
+        InteriorPointSolution::Infeasible => InteriorPointSolution::Infeasible,
     };
     return Ok(result);
 }
@@ -252,7 +239,7 @@ fn adjacency(
     let index_map = Vec::from_iter(indices); // Maps the essential index back to the original indices
     let mut res: HashMap<usize, Vec<usize>> = HashMap::with_capacity(index_map.len());
 
-    for (index, vertex) in essential_vertices.iter().enumerate() {
+    for (index, _vertex) in essential_vertices.iter().enumerate() {
         let linearity = Vec::from([Rc::clone(&essential_vertices[index])]);
         eprintln!("Finding adjacent");
         let adjacent = find_essential(essential_vertices, &linearity)?;
@@ -325,33 +312,72 @@ impl Polytope {
             .adjacency
             .iter()
             .zip_eq(self.edges.axis_iter(Axis(0)))
-            .filter(move |tup| tup.0.0 == vertex);
+            .filter(move |tup| tup.0 .0 == vertex);
         return Box::new(iterator);
     }
 
     fn maximised_vertex(self: &Polytope, param: &Array1<f64>) -> Result<usize> {
         return Ok(param.dot(&self.vertices).argmax()?);
     }
+
+    fn scores(self: &Polytope, param: &Array1<f64>) -> Vec<(usize, f64)>{
+        let scores = param.dot(&self.vertices);
+        return scores.iter().enumerate().sorted_by(|(_ai, a_score), (_bi, b_score) |
+            if *a_score - *b_score < 0. {
+                Ordering::Less
+            }else{
+                Ordering::Greater
+            }
+        ).map(|(i, s)| (i, *s)).collect::<Vec<_>>()
+    }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ReverseSearchState {
+#[derive(Clone)]
+struct ReverseSearchState{
     param: Array1<f64>,
     minkowski_decomp: Vec<usize>,
     neighbour_index: usize,
     polytope_index: usize,
+    polys: Rc<Vec<Polytope>>
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ReverseSearchOut{
+    param: Array1<f64>,
+    minkowski_decomp: Vec<usize>,
 }
 
 impl ReverseSearchState {
-    fn vertex(self: &ReverseSearchState) -> usize {
+    fn vertex(&self) -> usize {
         return self.minkowski_decomp[self.polytope_index];
     }
+
+    fn polytope(&self) -> &Polytope {
+        return &self.polys[self.polytope_index];
+    }
+
+    fn neighbours(&self) -> Vec<&(usize, usize)> {
+        return self.polytope().neighbours(self.vertex());
+    }
+
+    fn complete(&self) -> bool {
+        return self.polytope_index >= self.polys.len();
+    }
+
+    fn incr_state(&mut self) -> () {
+        self.neighbour_index += 1;
+        if self.neighbour_index >= self.neighbours().len() {
+            self.polytope_index += 1;
+            self.neighbour_index = 0;
+        }
+    }
+    
 }
 
 #[derive(Debug)]
 struct AdjacencyTuple {
     polytope_index: usize,
-    vertex: usize,
+    _vertex: usize,
     neighbour: usize,
 }
 
@@ -441,11 +467,25 @@ impl FullPolytope {
         });
         return poly.transpose();
     }
+
+    // Map the essential indices back to full polytope raw indices before exporting
+    fn map_essential_index(self: &FullPolytope, index: usize) -> Option<usize> {
+        return self.essential_indices.as_ref().and_then(|m| {
+            m.iter()
+                .enumerate()
+                .filter(|(essential, _r)| *essential == index)
+                .map(|(_e, raw)| *raw)
+                .take(1)
+                .collect::<Vec<_>>()
+                .first()
+                .map(|i| *i)
+        });
+    }
 }
 
-fn inc_mink_sum_setup(
+fn mink_sum_setup<'a>(
     poly_list: &mut [FullPolytope],
-) -> Result<(Vec<Polytope>, ReverseSearchState)> {
+) -> Result<ReverseSearchState> {
     for poly in poly_list.as_mut() {
         poly.fill_essential()?;
         poly.fill_adjacency()?;
@@ -459,7 +499,9 @@ fn inc_mink_sum_setup(
         .map(|p| p.ok_or(anyhow!("No item")))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let dim = essential_polys
+    let polys_ref = Rc::new(essential_polys); 
+
+    let dim = polys_ref
         .first()
         .map(|p| p.vertices.shape()[0])
         .ok_or(anyhow!("No polytopes!"))?;
@@ -469,6 +511,7 @@ fn inc_mink_sum_setup(
         minkowski_decomp: Vec::with_capacity(poly_list.as_ref().len()),
         polytope_index: 0,
         neighbour_index: 0,
+        polys: polys_ref
     };
 
     // Checking to see if any vertices in a polytope have the same score
@@ -478,7 +521,7 @@ fn inc_mink_sum_setup(
     let mut ties = true;
     while ties {
         ties = false;
-        for (i, polytope) in essential_polys.iter().enumerate() {
+        for (i, polytope) in state.polys.iter().enumerate() {
             debug!("Testing polytope {} for ties with initial param", i);
             let scores = state.param.dot(&polytope.vertices);
             let mut prev_best = *scores.first().unwrap_or(&0.0);
@@ -506,14 +549,14 @@ fn inc_mink_sum_setup(
             }
         }
     }
-    let max_vertices = essential_polys
+    let max_vertices = state.polys
         .iter()
         .map(|p| state.param.dot(&p.vertices).argmax())
         .collect::<std::result::Result<Vec<_>, _>>()?;
     state.minkowski_decomp = max_vertices;
     debug!("Minkowski decomposition {:?}", &state.minkowski_decomp);
     info!("Setup done");
-    return Ok((essential_polys, state));
+    return Ok(state);
 }
 
 // Find the parent of a cone. We shoot a ray towards the initial
@@ -534,24 +577,9 @@ fn parent(
     let edge_t = edges.t();
     let inner_product_point = interior_point.dot(&edge_t);
     let inner_product_direction = direction.dot(&edge_t);
-    debug!(
-        "Inner product point {:?}\n Inner product direction {:?}",
-        inner_product_point.iter().enumerate().collect::<Vec<_>>(), inner_product_direction.iter().enumerate().collect::<Vec<_>>()
-    );
-    let mut alpha = &inner_product_direction / &inner_product_point;
-    /*alpha.map_inplace(|a| {
-        if *a < 0. {
-            *a = f64::NEG_INFINITY
-        }
-    });*/
+    let alpha = &inner_product_direction / &inner_product_point;
     let parent = alpha.argmax()?;
-    debug!("Parent index {}", parent);
-    debug!("Alpha {:?}", &alpha);
     let min = alpha[parent];
-    debug!(
-        "Min {}, min IP {}, min dir {}",
-        min, inner_product_point[parent], inner_product_direction[parent]
-    );
     debug_assert_eq!(
         alpha.iter().filter(|a| (*a - min).abs() < EPSILON).count(),
         1,
@@ -560,9 +588,9 @@ fn parent(
     return Ok(parent);
 }
 
-pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearchState>> {
-    let (polys, initial_state) = inc_mink_sum_setup(poly_list)?;
-    let initial_state = initial_state;
+pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearchOut>> {
+    let initial_state = mink_sum_setup(poly_list)?;
+    let polys = initial_state.polys.clone();
     let num_edges: usize = polys.iter().map(|p| p.edges.len()).sum();
     info!("Total edges: {}", num_edges);
     // Allocate these arrays in advance
@@ -572,16 +600,20 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
     let mut stack: Vec<ReverseSearchState> = Vec::new();
     stack.push(initial_state.clone());
 
-    let mut res: Vec<ReverseSearchState> = Vec::new();
+    let mut res: Vec<ReverseSearchOut> = Vec::new();
 
     while !stack.is_empty() {
-        if res.len() >= 10 {
-            info!("10 results found. Breaking");
-            break;
-        }
+        // if res.len() >= 10 {
+        //     info!("10 results found. Breaking");
+        //     break;
+        // }
+        debug!("Num results {}", res.len());
         let mut state = stack
             .pop()
             .ok_or(anyhow!("Empty stack! This should never happen"))?;
+        if state.complete() {
+            continue;
+        }
         debug!(
             "Starting state: polytope {} vertex {} neighbour counter {}",
             state.polytope_index,
@@ -590,23 +622,8 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
         );
         edges.clear();
 
-        let mut polytope = &polys[state.polytope_index];
-        let mut vertex = state.vertex();
 
-        let mut neighbours = polytope.neighbours(vertex);
-        state.neighbour_index += 1;
-        if state.neighbour_index >= neighbours.len() {
-            state.polytope_index += 1;
-            if state.polytope_index >= polys.len() {
-                continue;
-            }
-            polytope = &polys[state.polytope_index];
-            vertex = state.vertex();
-
-            state.neighbour_index = 0;
-            neighbours = polytope.neighbours(vertex);
-        }
-
+        let neighbours = state.neighbours();
         let test_vertex = neighbours[state.neighbour_index].1;
 
         let mut test_edge: Option<(usize, ArrayView1<f64>)> = None;
@@ -623,7 +640,6 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
             }
         }
         let (test_edge_index, test_edge) = test_edge.ok_or(anyhow!("No edge found!"))?;
-        debug!("edges len {}", edges.len());
         // Test if edge is leaving objective
         let score = state.param.dot(&test_edge);
         if score < -1. * EPSILON {
@@ -631,6 +647,7 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
                 "Skipping because edge is not leading away from objective. Score: {}",
                 score
             );
+            state.incr_state();
             stack.push(state);
             continue;
         }
@@ -643,6 +660,7 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
         };
         if !is_adjacent {
             debug!("Skipping because edge is not adjacent");
+            state.incr_state();
             stack.push(state);
             continue;
         }
@@ -657,33 +675,34 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
         for (inner_polytope_index, (poly, inner_vertex)) in
             polys.iter().zip(&test_decomp).enumerate()
         {
-            debug!(
-                "Poly index {}, inner vertex {}, neighbours {:?}",
-                inner_polytope_index,
-                inner_vertex,
-                poly.neighbours(*inner_vertex)
-            );
             for (adj, edge) in poly.neighbouring_edges(*inner_vertex) {
                 edges.push(edge.into_shape((1, edge.shape()[0]))?);
-                debug!("Double check indices {} {} {}", inner_polytope_index, adj.0, adj.1);
                 edge_indices.push(AdjacencyTuple {
                     polytope_index: inner_polytope_index,
-                    vertex: adj.0,
+                    _vertex: adj.0,
                     neighbour: adj.1,
                 });
             }
         }
         debug_assert_eq!(edges.len(), edge_indices.len());
-        debug!("Edge indices {:?}", edge_indices.iter().enumerate().collect::<Vec<_>>());
         let test_edges_array: Array2<f64> = ndarray::concatenate(Axis(0), &edges)?;
 
         let maximiser = lp_normal_cone(&test_edges_array)?;
         let maximiser_norm = &maximiser / maximiser.norm();
+        
         debug!("Maximiser: {:?}", maximiser_norm);
         fn test_edges(edges: &Array2<f64>, maximiser: &Array1<f64>) -> Result<bool> {
             let scores = maximiser.dot(&edges.t()).map(|score| *score > EPSILON);
-            let test = scores.iter().map(|t| *t).reduce(|acc, test| acc && test);
-            return test.ok_or(anyhow!("No scores! - edge array must be empty"));
+            let test_op = scores.iter().map(|t| *t).reduce(|acc, test| acc && test);
+            let test = test_op.ok_or(anyhow!("No scores! - edge array must be empty"))?;
+            if ! test {
+                for (edge_id, score) in maximiser.dot(&edges.t()).iter().enumerate(){
+                    if *score < EPSILON {
+                        debug!("Score {} for edge {} is below epsilon", *score, edge_id);
+                    }
+                }
+            }
+            return Ok(test);
         }
 
         fn test_maximiser(
@@ -701,11 +720,22 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
                 .map(|(left, right)| *left == *right)
                 .reduce(|accm, test| accm && test)
                 .ok_or(anyhow!("Empty decomp!"))?;
+            if ! equal_decomp {
+                for ((decomp_val, maximised_val), poly) in decomp.iter().zip_eq(maximised).zip_eq(polys){
+                    if *decomp_val != maximised_val {
+                        let scores = poly.scores(maximiser);
+                        for (vertex, score) in scores {
+                            debug!("{}, {}", vertex, score);
+                        }
+                    }
+                }
+            }
             return Ok(equal_decomp);
         }
 
         debug_assert!(
-            test_edges(&test_edges_array, &maximiser_norm)?,
+            // Some distance from edges are very small. The normalisation pushes them below epsilon. Use the raw maximiser instead
+            test_edges(&test_edges_array, &maximiser)?,
             "Because we have tested for adjacency, we should always get a maximiser"
         );
 
@@ -716,7 +746,6 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
 
         let parent_edge = parent(&test_edges_array, &maximiser_norm, &initial_state.param)?;
         let parent_edge_index = &edge_indices[parent_edge];
-        debug!("Parent edge {:?}", parent_edge_index);
         let mut parent = test_decomp.clone();
         parent[parent_edge_index.polytope_index] = parent_edge_index.neighbour;
 
@@ -724,18 +753,28 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
         debug!("  Test decomp: {:?}", &test_decomp);
         debug!(" State decomp: {:?}", &state.minkowski_decomp);
         if parent == state.minkowski_decomp {
-            // Need to test rust vec equality
-            debug!("Reverse step");
             let child_state = ReverseSearchState {
                 polytope_index: 0,
                 neighbour_index: 0,
                 param: maximiser_norm,
                 minkowski_decomp: test_decomp,
+                polys: state.polys.clone()
             };
-            res.push(child_state.clone());
+            let mut output = ReverseSearchOut{
+                param: child_state.param.clone(),
+                minkowski_decomp: child_state.minkowski_decomp.clone()
+            };
+            for (vertex, full_poly) in output.minkowski_decomp.iter_mut().zip(poly_list.as_ref()) {
+                *vertex = full_poly
+                    .map_essential_index(*vertex)
+                    .ok_or(anyhow!("Essential vertex not found!"))?;
+            }
+            res.push(output);
+            state.incr_state();
             stack.push(state);
             stack.push(child_state);
         } else {
+            state.incr_state();
             stack.push(state);
         }
     }
