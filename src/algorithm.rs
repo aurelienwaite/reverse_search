@@ -158,38 +158,6 @@ fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<InteriorPointSolu
         .into_shape(edges.shape()[1])?;
     let objective_vec = &test_vec * 1.;
 
-    /*
-    let dim = edges.shape()[1];
-    let mut vars = variables!();
-    let mut x: Vec<good_lp::Variable> = Vec::with_capacity(dim);
-    for _i in 0..dim {
-        x.push(vars.add_variable());
-    }
-    let objective = inner_product_lp_ndarray(&objective_vec.view(), &x);
-    let mut problem = vars.maximise(objective).using(default_solver);
-    // Minksum adds a 1 to the objective and adds it as constraint. Assuming that this
-    // is a bounding constraint and reproducing here.
-    //let bounding_constraint = inner_product_lp_ndarray(&(&test_vec * -1.0).view(), &x);
-    //problem = problem.with(constraint!(bounding_constraint <= 1.));
-
-    // The edges have been normalised, making it easy to test for parallelism
-    let parallel = test_vec
-        .dot(&edges.t())
-        .map(|d| (d.abs() - 1.).abs() < EPSILON);
-    for (i, (edge, is_parallel)) in edges.axis_iter(Axis(0)).zip(parallel).enumerate() {
-        // Don't add parallel edges. This is different to the minksum
-        // implementation that returns false if the polytope or neighbour
-        // is indexed lower than the given indices.
-        if !is_parallel {
-            debug!("Adding edge {}", i);
-            let constraint = inner_product_lp_ndarray(&(&edge * -1.0).view(), &x);
-            problem = problem.with(constraint!(constraint <= 0.));
-        }
-    }
-
-    let solution = problem.solve()?;
-    */
-
     // The edges have been normalised, making it easy to test for parallelism
     let parallel = test_vec
         .dot(&edges.t())
@@ -588,7 +556,7 @@ fn parent(
     return Ok(parent);
 }
 
-pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearchOut>> {
+pub fn reverse_search<'a>(poly_list: &mut [FullPolytope], mut writer: Box<dyn FnMut(ReverseSearchOut) -> Result<()> + 'a>) -> Result<()> {
     let initial_state = mink_sum_setup(poly_list)?;
     let polys = initial_state.polys.clone();
     let num_edges: usize = polys.iter().map(|p| p.edges.len()).sum();
@@ -600,14 +568,7 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
     let mut stack: Vec<ReverseSearchState> = Vec::new();
     stack.push(initial_state.clone());
 
-    let mut res: Vec<ReverseSearchOut> = Vec::new();
-
     while !stack.is_empty() {
-        // if res.len() >= 10 {
-        //     info!("10 results found. Breaking");
-        //     break;
-        // }
-        debug!("Num results {}", res.len());
         let mut state = stack
             .pop()
             .ok_or(anyhow!("Empty stack! This should never happen"))?;
@@ -631,8 +592,9 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
         for (inner_polytope_index, (poly, inner_vertex)) in
             polys.iter().zip(&state.minkowski_decomp).enumerate()
         {
-            for (index, edge) in poly.neighbouring_edges(*inner_vertex) {
-                if inner_polytope_index == state.polytope_index && test_vertex == index.1 {
+            for ((_vertex, neighbouring_vertex), edge) in poly.neighbouring_edges(*inner_vertex) {
+                if inner_polytope_index == state.polytope_index && test_vertex == *neighbouring_vertex {
+                    debug_assert_eq!(test_edge, None);
                     test_edge = Some((edge_counter, edge));
                 }
                 edges.push(edge.into_shape((1, edge.shape()[0]))?);
@@ -668,6 +630,10 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
         let mut test_decomp = state.minkowski_decomp.clone();
         test_decomp[state.polytope_index] = neighbours[state.neighbour_index].1;
         debug!("Test decomposition {:?}", &test_decomp);
+        if test_decomp == initial_state.minkowski_decomp {
+            debug!("Reached the initial state. Loop complete");
+            continue;
+        }
 
         //rebuild edges for new cone
         edges.clear();
@@ -753,6 +719,7 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
         debug!("  Test decomp: {:?}", &test_decomp);
         debug!(" State decomp: {:?}", &state.minkowski_decomp);
         if parent == state.minkowski_decomp {
+            // Reverse traverse
             let child_state = ReverseSearchState {
                 polytope_index: 0,
                 neighbour_index: 0,
@@ -769,7 +736,7 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
                     .map_essential_index(*vertex)
                     .ok_or(anyhow!("Essential vertex not found!"))?;
             }
-            res.push(output);
+            writer(output)?;
             state.incr_state();
             stack.push(state);
             stack.push(child_state);
@@ -778,5 +745,5 @@ pub fn reverse_search(poly_list: &mut [FullPolytope]) -> Result<Vec<ReverseSearc
             stack.push(state);
         }
     }
-    return Ok(res);
+    return Ok(());
 }

@@ -43,17 +43,6 @@ fn write_polytope(poly_str: &Vec<FullPolytope>, out_filename: &String) -> Result
     return Ok(());
 }
 
-fn write_search_results(states: &Vec<ReverseSearchOut>, out_filename: &String) -> Result<()>{
-    info!("Saving {} search results to {}", states.len(), out_filename);
-    let out_string = serde_json::to_string_pretty(states)?;
-    let states_out_file = File::create(out_filename)?;
-    let mut writer = BufWriter::new(states_out_file);    
-    writer.write(out_string.as_bytes())?;
-    return Ok(());
-}
-
-
-
 fn main() -> Result<()>{
     TermLogger::init(LevelFilter::Debug, Config::default(), TerminalMode::Stderr, ColorChoice::Auto)?;
 
@@ -66,9 +55,22 @@ fn main() -> Result<()>{
     let mut contents = String::new();
     buf_reader.read_to_string(&mut contents)?;
     let mut poly = read_polytope(contents)?;
-    let states = reverse_search(&mut poly)?;
+    
+    info!("Saving search results to {}", &args.reserve_search_out);
+    let states_out_file = File::create(&args.reserve_search_out)?;
+    let mut writer = BufWriter::new(states_out_file);   
+
+    let mut counter = 0;
+    let writer_callback = Box::new(|rs_out: ReverseSearchOut| {
+        counter += 1;
+        info!("Writing result {}", counter);
+        let out_string = serde_json::to_string(&rs_out)? +"\n";
+        writer.write(out_string.as_bytes())?;
+        return Ok(());
+    });
+
+    reverse_search(&mut poly, writer_callback)?;
     write_polytope(&poly, &args.polytope_out)?;
-    write_search_results(&states, &args.reserve_search_out)?;
     return Ok(());
 }
 
