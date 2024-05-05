@@ -64,7 +64,7 @@ fn main() -> Result<()>{
     let writer_callback = Box::new(|rs_out: ReverseSearchOut| {
         counter += 1;
         info!("Writing result {}", counter);
-        let out_string = serde_json::to_string(&rs_out)? +"\n";
+        let out_string = serde_json::to_string(&rs_out)? + "\n";
         writer.write(out_string.as_bytes())?;
         return Ok(());
     });
