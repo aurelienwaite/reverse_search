@@ -1,9 +1,16 @@
 [package]
 name = "reverse_search"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
+description = "An implementation of Avis and Fukuda's reverse search algorithm for computing the Minkowski Sums of polytopes. See https://www.sciencedirect.com/science/article/pii/S0747717104000409"
+readme = "README.md"
+repository = "https://github.com/aurelienwaite/reverse_search"
+license = "MIT"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+include = [
+    "**/*.rs",
+    "Cargo.toml",
+]
 
 [dependencies]
 clap = { version = "4.2.1", features = ["derive"] }
