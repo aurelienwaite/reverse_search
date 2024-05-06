@@ -10,8 +10,7 @@ use algorithm::FullPolytope;
 use anyhow::Result;
 use simplelog::*;
 use crate::algorithm::reverse_search;
-use log::{debug, info};
-use std::rc::Rc;
+use log::info;
 
 pub mod algorithm;
 
@@ -44,7 +43,7 @@ fn write_polytope(poly_str: &Vec<FullPolytope>, out_filename: &String) -> Result
 }
 
 fn main() -> Result<()>{
-    TermLogger::init(LevelFilter::Debug, Config::default(), TerminalMode::Stderr, ColorChoice::Auto)?;
+    TermLogger::init(LevelFilter::Info, Config::default(), TerminalMode::Stderr, ColorChoice::Auto)?;
 
     let args = Args::parse();
 
