@@ -1,8 +1,8 @@
 [package]
 name = "reverse_search"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
-description = "An implementation of Avis and Fukuda's reverse search algorithm for computing the Minkowski Sums of polytopes. See https://www.sciencedirect.com/science/article/pii/S0747717104000409"
+description = "An implementation of Avis and Fukuda's reverse search algorithm for computing the Minkowski Sums of polytopes.
 readme = "README.md"
 repository = "https://github.com/aurelienwaite/reverse_search"
 license = "MIT"
@@ -24,10 +24,7 @@ good_lp = { version = "1.7.0", features = ["lpsolve"], default-features = false 
 anyhow = "1.0"
 log = "0.4"
 simplelog = "0.12.2"
-ndarray = { version = "0.15.6", features = ["serde", "blas"] } 
+ndarray = { version = "0.15.6", features = ["serde"] } 
 ndarray-rand = "0.14.0"
 ndarray-stats = "0.5.1"
-ndarray-linalg = "0.16.0"
 itertools = "0.12.1"
-blas-src = { version = "0.8", features = ["openblas"] }
-openblas-src = { version = "0.10.9", features = ["cblas", "system"] }

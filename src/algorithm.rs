@@ -1,5 +1,3 @@
-extern crate blas_src;
-
 use anyhow::{anyhow, Result};
 use good_lp::{
     constraint, default_solver, variables, Expression, ResolutionError, Solution, SolverModel,
@@ -7,8 +5,6 @@ use good_lp::{
 use itertools::Itertools;
 use log::{debug, info};
 use ndarray::{concatenate, prelude::*};
-use ndarray_linalg::norm::normalize;
-use ndarray_linalg::{Norm, NormalizeAxis};
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
 use ndarray_stats::QuantileExt;
@@ -36,6 +32,15 @@ enum EssentialSolution {
 enum InteriorPointSolution {
     Feasible(Array1<f64>), // Contains the certificate of the solution
     Infeasible,
+}
+
+// Cannot use linalg on wasm because of BLAS. Build our own l2_norm function.
+fn l2_norm(to_norm: &[f64]) -> f64 {
+    to_norm
+        .iter()
+        .map(|v| v.powi(2))
+        .fold(0., |l, r| l + r)
+        .sqrt()
 }
 
 fn inner_product_lp(coefficients: &Vector, variables: &[good_lp::Variable]) -> Expression {
@@ -342,7 +347,7 @@ impl ReverseSearchState {
         if self.neighbour_index >= self.neighbours().len() {
             self.polytope_index += 1;
             self.neighbour_index = 0;
-            if !self.complete(){
+            if !self.complete() {
                 self.vertex = minkowski_decomp[self.polytope_index];
             }
         }
@@ -483,23 +488,30 @@ impl FullPolytope {
                     return e.view().into_shape((1, dim));
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let edge_array: Array2<f64> = ndarray::concatenate(Axis(0), &expanded_dims)?;
+            let mut edge_array: Array2<f64> = ndarray::concatenate(Axis(0), &expanded_dims)?;
             let vec_adjacency = adjacency
                 .iter()
                 .map(|(_vertex, neighbours)| neighbours.iter().map(|n| *n).collect::<Vec<_>>())
                 .collect::<Vec<_>>();
+            for mut row in edge_array.rows_mut() {
+                let row_slice = row
+                    .as_slice()
+                    .ok_or(anyhow!("Incorrect memory layout in edges"))?;
+                let norm = l2_norm(row_slice);
+                row.mapv_inplace(|v| v / norm);
+            }
             let polytope = Polytope {
                 adjacency: vec_adjacency,
                 vertices: vertices,
                 flattened_adjacency,
-                edges: normalize(edge_array, NormalizeAxis::Row).0,
+                edges: edge_array,
             };
 
-            fn test_polytope(poly: &Polytope) -> bool{
+            fn test_polytope(poly: &Polytope) -> bool {
                 let mut correct = true;
                 let mut flat_index: usize = 0;
                 for (vertex, neighbours) in poly.adjacency.iter().enumerate() {
-                    for neighbour in neighbours{
+                    for neighbour in neighbours {
                         let flat = &poly.flattened_adjacency[flat_index];
                         correct = correct && flat.0 == vertex && flat.1 == *neighbour;
                         flat_index += 1;
@@ -657,7 +669,10 @@ pub fn reverse_search<'a>(
             .pop()
             .ok_or(anyhow!("Empty stack! This should never happen"))?;
         if state.complete() {
-            debug!("Popping, restoring element {} to {}", state.previous_polytope_index, state.previous_vertex);
+            debug!(
+                "Popping, restoring element {} to {}",
+                state.previous_polytope_index, state.previous_vertex
+            );
             minkowski_decomp[state.previous_polytope_index] = state.previous_vertex;
             continue;
         }
@@ -728,7 +743,9 @@ pub fn reverse_search<'a>(
         let test_edges_array: Array2<f64> = ndarray::concatenate(Axis(0), &edges)?;
 
         let maximiser = lp_normal_cone(&test_edges_array)?;
-        let maximiser_norm = &maximiser / maximiser.norm();
+        let norm = l2_norm(maximiser.as_slice().ok_or(anyhow!("Incorrect memory"))?);
+        let maximiser_norm =
+            &maximiser / norm;
 
         debug!("Maximiser: {:?}", maximiser_norm);
         fn test_edges(edges: &Array2<f64>, maximiser: &Array1<f64>) -> Result<bool> {
@@ -795,13 +812,20 @@ pub fn reverse_search<'a>(
             parent_edge_index.neighbour,
         );
 
-        debug!("Parent decomp: {:?}", decomp_iter(test_iter(), &parent_decomp_index).collect::<Vec<_>>());
+        debug!(
+            "Parent decomp: {:?}",
+            decomp_iter(test_iter(), &parent_decomp_index).collect::<Vec<_>>()
+        );
         debug!("  Test decomp: {:?}", test_iter().collect::<Vec<_>>());
         debug!(" State decomp: {:?}", &minkowski_decomp);
-        if test_decomp_index.polytope_index == parent_decomp_index.polytope_index && minkowski_decomp[parent_decomp_index.polytope_index] == parent_decomp_index.vertex {
+        if test_decomp_index.polytope_index == parent_decomp_index.polytope_index
+            && minkowski_decomp[parent_decomp_index.polytope_index] == parent_decomp_index.vertex
+        {
             // Reverse traverse
             debug!("Reverse traverse");
-            let child_vertex = test_iter().next().ok_or(anyhow!("Test decomposition is empty"))?;
+            let child_vertex = test_iter()
+                .next()
+                .ok_or(anyhow!("Test decomposition is empty"))?;
             let child_state = state.make_child(*child_vertex, maximiser_norm);
             state.incr_state(&minkowski_decomp);
             minkowski_decomp[test_decomp_index.polytope_index] = test_decomp_index.vertex;
