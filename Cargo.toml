@@ -1,6 +1,6 @@
 [package]
 name = "reverse_search"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2021"
 description = "An implementation of Avis and Fukuda's reverse search algorithm for computing the Minkowski Sums of polytopes."
 readme = "README.md"
@@ -20,7 +20,7 @@ path = "src/algorithm.rs"
 clap = { version = "4.2.1", features = ["derive"] }
 serde = { version = "1.0.159", features = ["serde_derive", "rc"] }
 serde_json = "1.0"
-good_lp = { version = "1.7.0", features = ["lpsolve"], default-features = false }
+good_lp = { version = "1.7.0", features = ["clarabel"], default-features = false }
 anyhow = "1.0"
 log = "0.4"
 simplelog = "0.12.2"
