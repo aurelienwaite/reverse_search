@@ -1,8 +1,9 @@
+extern crate blas_src;
+
 use anyhow::{anyhow, Result};
 use good_lp::{
     constraint, default_solver, variables, Expression, ResolutionError, Solution, SolverModel,
 };
-
 use itertools::Itertools;
 use log::{debug, info};
 use ndarray::{concatenate, prelude::*};
