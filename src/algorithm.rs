@@ -321,8 +321,8 @@ struct ReverseSearchState {
 
 #[derive(Serialize, Deserialize)]
 pub struct ReverseSearchOut {
-    param: Array1<f64>,
-    minkowski_decomp: Vec<usize>,
+    pub param: Array1<f64>,
+    pub minkowski_decomp: Vec<usize>,
 }
 
 impl ReverseSearchState {
@@ -850,6 +850,7 @@ pub fn reverse_search<'a>(
                     .map_essential_index(*vertex)
                     .ok_or(anyhow!("Essential vertex not found!"))?;
             }
+
             writer(output)?;
 
             stack.push(child_state);
