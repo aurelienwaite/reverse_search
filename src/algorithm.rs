@@ -257,7 +257,7 @@ fn find_essential(
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct FullPolytope {
-    vertices: Matrix,
+    pub vertices: Matrix,
     essential_indices: Option<BTreeSet<usize>>,
     adjacency: Option<HashMap<usize, Vec<usize>>>,
     essential_certs: Option<HashMap<usize, Vec<f64>>>,
