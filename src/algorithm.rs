@@ -413,6 +413,15 @@ impl DecompositionIndex {
 }
 
 impl FullPolytope {
+    pub fn new(vertices: Matrix) -> FullPolytope {
+        FullPolytope {
+            vertices,
+            essential_indices: None,
+            essential_certs: None,
+            adjacency: None,
+        }
+    }
+
     fn fill_essential(&mut self) -> Result<()> {
         let essential = find_essential(&self.vertices, &EMPTY_MATRIX)?;
         self.essential_indices = Option::Some(essential.0);
@@ -744,8 +753,7 @@ pub fn reverse_search<'a>(
 
         let maximiser = lp_normal_cone(&test_edges_array)?;
         let norm = l2_norm(maximiser.as_slice().ok_or(anyhow!("Incorrect memory"))?);
-        let maximiser_norm =
-            &maximiser / norm;
+        let maximiser_norm = &maximiser / norm;
 
         debug!("Maximiser: {:?}", maximiser_norm);
         fn test_edges(edges: &Array2<f64>, maximiser: &Array1<f64>) -> Result<bool> {
