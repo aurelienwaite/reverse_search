@@ -234,7 +234,17 @@ fn find_essential(
     let mut certs: HashMap<usize, Vec<f64>> = HashMap::new();
     for (index, vertex) in (vertices).iter().enumerate() {
         let other = make_other_matrix(&vertices, index);
-        let lp_solution = lp_separation(vertex, &other, linearity)?;
+        let lp_res = lp_separation(vertex, &other, linearity);
+        if lp_res.as_ref().is_err() {
+            let error_msg = lp_res
+                .as_ref()
+                .map_err(|err| err.to_string())
+                .err()
+                .unwrap_or(String::from("No message"));
+            info!("Error finding essential vertex, skipping. {}", error_msg);
+            continue;
+        }
+        let lp_solution = lp_res?;
         let is_essential = match lp_solution {
             EssentialSolution::Essential(cert) => {
                 certs.insert(index, cert);
