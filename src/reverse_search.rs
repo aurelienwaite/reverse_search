@@ -8,24 +8,18 @@ use ndarray::{concatenate, prelude::*};
 use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
 use ndarray_stats::QuantileExt;
-use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::rc::Rc;
 use std::usize;
 
-type Vector = [f64];
-type Matrix = Vec<Rc<Vector>>;
-
-const EMPTY_MATRIX: Matrix = Vec::new();
-
 // Used for the LP separation problem. Due to the formalisation of the LP the number will always
 // be in the range [0,1]. Having a fixed epsilon is probably ok.
 const EPSILON: f64 = 1e-6;
 
 enum EssentialSolution {
-    Essential(Vec<f64>), // Contains the certificate of the solution
+    Essential(Array1<f64>), // Contains the certificate of the solution
     Redundant,
 }
 
@@ -41,14 +35,6 @@ fn l2_norm(to_norm: &[f64]) -> f64 {
         .map(|v| v.powi(2))
         .fold(0., |l, r| l + r)
         .sqrt()
-}
-
-fn inner_product_lp(coefficients: &Vector, variables: &[good_lp::Variable]) -> Expression {
-    return coefficients
-        .iter()
-        .zip_eq(variables)
-        .map(|item| *item.0 * *item.1)
-        .sum();
 }
 
 // Frustratingly, I can't seem to find a way to make this generic with inner_product_lp
@@ -67,9 +53,9 @@ fn inner_product_lp_ndarray(
 
 // Used to detecting extreme points in individual polytopes
 fn lp_separation(
-    to_test: &Vector,
-    vertices: &Matrix,
-    linearity: &Matrix,
+    to_test: &ArrayView1<f64>,
+    vertices: &[ArrayView2<f64>], // For efficiency we often want to pass slices of a single matrix. Saves array copies
+    linearity: &ArrayView2<f64>,
 ) -> Result<EssentialSolution, ResolutionError> {
     let mut vars = variables!();
     let dim = to_test.len();
@@ -79,17 +65,23 @@ fn lp_separation(
     }
     let d = vars.add_variable();
 
-    let objective = d + inner_product_lp(&to_test, &x);
+    let objective = d + inner_product_lp_ndarray(&to_test, &x);
     let mut problem = vars
         .maximise(&objective)
         .using(default_solver)
-        .with(constraint!(d + inner_product_lp(&to_test, &x) <= 1.));
+        .with(constraint!(
+            d + inner_product_lp_ndarray(&to_test, &x) <= 1.
+        ));
 
-    for vertex in vertices {
-        problem = problem.with(constraint!(d + inner_product_lp(&vertex, &x) <= 0.));
+    for slice in vertices {
+        for vertex in (*slice).axis_iter(Axis(0)) {
+            problem = problem.with(constraint!(d + inner_product_lp_ndarray(&vertex, &x) <= 0.));
+        }
     }
-    for generator in linearity {
-        problem = problem.with(constraint!(d + inner_product_lp(&generator, &x) == 0.));
+    for generator in linearity.axis_iter(Axis(0)) {
+        problem = problem.with(constraint!(
+            d + inner_product_lp_ndarray(&generator, &x) == 0.
+        ));
     }
 
     let solution = problem.solve()?;
@@ -98,7 +90,7 @@ fn lp_separation(
         let mut cert: Vec<f64> = Vec::with_capacity(x.len());
         cert.push(solution.value(d));
         cert.extend(x.iter().map(|variable| solution.value(*variable)));
-        EssentialSolution::Essential(cert)
+        EssentialSolution::Essential(Array1::<f64>::from(cert))
     } else {
         EssentialSolution::Redundant
     };
@@ -199,42 +191,37 @@ fn lp_adjacency(edges: &Array2<f64>, to_test: usize) -> Result<InteriorPointSolu
     return Ok(result);
 }
 
-fn make_other_matrix(vertices: &Matrix, to_remove: usize) -> Matrix {
-    let mut other: Matrix = Vec::with_capacity(vertices.len() - 1);
-    other.extend_from_slice(&vertices[0..to_remove]);
-    other.extend_from_slice(&vertices[to_remove + 1..vertices.len()]);
-    return other;
-}
-
 fn adjacency(
-    essential_vertices: &Matrix,
+    essential_vertices: &Array2<f64>,
     indices: &BTreeSet<usize>,
 ) -> Result<HashMap<usize, Vec<usize>>> {
     let index_map = Vec::from_iter(indices); // Maps the essential index back to the original indices
     let mut res: HashMap<usize, Vec<usize>> = HashMap::with_capacity(index_map.len());
 
-    for (index, _vertex) in essential_vertices.iter().enumerate() {
-        let linearity = Vec::from([Rc::clone(&essential_vertices[index])]);
-        eprintln!("Finding adjacent");
-        let adjacent = find_essential(essential_vertices, &linearity)?;
+    for (index, _vertex) in essential_vertices.axis_iter(Axis(0)).enumerate() {
+        let linearity: ArrayView2<f64> = essential_vertices.slice(s![index..index + 1, ..]);
+        debug!("Finding adjacent");
+        let adjacent = find_essential(&essential_vertices.view(), &linearity)?;
         res.insert(
             *index_map[index],
             Vec::from_iter(adjacent.0.iter().map(|adj| *index_map[*adj])),
         );
     }
-    eprintln!("{:?}", res);
+    debug!("{:?}", res);
     return Ok(res);
 }
 
 fn find_essential(
-    vertices: &Matrix,
-    linearity: &Matrix,
-) -> Result<(BTreeSet<usize>, HashMap<usize, Vec<f64>>)> {
+    vertices: &ArrayView2<f64>,
+    linearity: &ArrayView2<f64>,
+) -> Result<(BTreeSet<usize>, HashMap<usize, Array1<f64>>)> {
     let mut essential: BTreeSet<usize> = BTreeSet::new();
-    let mut certs: HashMap<usize, Vec<f64>> = HashMap::new();
-    for (index, vertex) in (vertices).iter().enumerate() {
-        let other = make_other_matrix(&vertices, index);
-        let lp_res = lp_separation(vertex, &other, linearity);
+    let mut certs: HashMap<usize, Array1<f64>> = HashMap::new();
+    for (index, vertex) in vertices.axis_iter(Axis(0)).enumerate() {
+        let before = vertices.slice(s![0..index, ..]);
+        let after = vertices.slice(s![index + 1.., ..]);
+        let other = [before, after];
+        let lp_res = lp_separation(&vertex, &other, &linearity.view());
         if lp_res.as_ref().is_err() {
             let error_msg = lp_res
                 .as_ref()
@@ -265,25 +252,25 @@ fn find_essential(
     return Ok((essential, certs));
 }
 
-#[derive(Serialize, Deserialize, Debug)]
-pub struct FullPolytope {
-    pub vertices: Matrix,
+#[derive(Debug)]
+pub struct Polytope {
+    pub vertices: Array2<f64>,
     essential_indices: Option<BTreeSet<usize>>,
     adjacency: Option<HashMap<usize, Vec<usize>>>,
-    essential_certs: Option<HashMap<usize, Vec<f64>>>,
+    essential_certs: Option<HashMap<usize, Array1<f64>>>,
 }
 
 // A polytope with essential data only
-struct Polytope {
+struct EssentialPolytope {
     vertices: Array2<f64>, // Transposed - dim x vertices
     flattened_adjacency: Vec<(usize, usize)>,
     edges: Array2<f64>,
     adjacency: Vec<Vec<usize>>,
 }
 
-impl Polytope {
+impl EssentialPolytope {
     fn neighbouring_edges<'a>(
-        self: &'a Polytope,
+        self: &'a EssentialPolytope,
         vertex: usize,
     ) -> Box<dyn Iterator<Item = (&(usize, usize), ArrayView1<f64>)> + 'a> {
         let iterator = self
@@ -294,11 +281,11 @@ impl Polytope {
         return Box::new(iterator);
     }
 
-    fn maximised_vertex(self: &Polytope, param: &Array1<f64>) -> Result<usize> {
-        return Ok(param.dot(&self.vertices).argmax()?);
+    fn maximised_vertex(self: &EssentialPolytope, param: &Array1<f64>) -> Result<usize> {
+        return Ok(self.vertices.dot(param).argmax()?);
     }
 
-    fn _scores(self: &Polytope, param: &Array1<f64>) -> Vec<(usize, f64)> {
+    fn _scores(self: &EssentialPolytope, param: &Array1<f64>) -> Vec<(usize, f64)> {
         let scores = param.dot(&self.vertices);
         return scores
             .iter()
@@ -326,17 +313,16 @@ struct ReverseSearchState {
     // We cache it in the state to make keeping track of diffs easier.
     // It must be kept in sync with the minkowski decomp
     vertex: usize,
-    polys: Rc<Vec<Polytope>>,
+    polys: Rc<Vec<EssentialPolytope>>,
 }
 
-#[derive(Serialize, Deserialize)]
 pub struct ReverseSearchOut {
     pub param: Array1<f64>,
     pub minkowski_decomp: Vec<usize>,
 }
 
 impl ReverseSearchState {
-    fn polytope(&self) -> &Polytope {
+    fn polytope(&self) -> &EssentialPolytope {
         return &self.polys[self.polytope_index];
     }
 
@@ -379,14 +365,14 @@ impl ReverseSearchState {
         let decomp = self
             .polys
             .iter()
-            .map(|p| self.param.dot(&p.vertices).argmax())
+            .map(|p| p.vertices.dot(&self.param).argmax())
             .collect::<std::result::Result<Vec<_>, _>>()?;
         debug!("Minkowski decomposition {:?}", &decomp);
         return Ok(decomp);
     }
 }
 
-fn make_state(param: Array1<f64>, polys: Rc<Vec<Polytope>>) -> Result<ReverseSearchState> {
+fn make_state(param: Array1<f64>, polys: Rc<Vec<EssentialPolytope>>) -> Result<ReverseSearchState> {
     let vertex = polys[0].maximised_vertex(&param)?;
     let state = ReverseSearchState {
         param,
@@ -422,9 +408,9 @@ impl DecompositionIndex {
     }
 }
 
-impl FullPolytope {
-    pub fn new(vertices: Matrix) -> FullPolytope {
-        FullPolytope {
+impl Polytope {
+    pub fn new(vertices: Array2<f64>) -> Polytope {
+        Polytope {
             vertices,
             essential_indices: None,
             essential_certs: None,
@@ -433,19 +419,17 @@ impl FullPolytope {
     }
 
     fn fill_essential(&mut self) -> Result<()> {
-        let essential = find_essential(&self.vertices, &EMPTY_MATRIX)?;
+        let empty = Array2::<f64>::zeros((0, 0));
+        let essential = find_essential(&self.vertices.view(), &empty.view())?;
         self.essential_indices = Option::Some(essential.0);
         self.essential_certs = Option::Some(essential.1);
         return Ok(());
     }
 
-    fn essential_vertices(&self) -> Option<Matrix> {
+    fn essential_vertices(&self) -> Option<Array2<f64>> {
         return self.essential_indices.as_ref().map(|indices| {
-            Vec::from_iter(
-                indices
-                    .iter()
-                    .map(|index| Rc::clone(&(self.vertices[*index]))),
-            )
+            let as_slice = indices.iter().map(|i| *i).collect::<Vec<_>>();
+            self.vertices.select(Axis(0), &as_slice)
         });
     }
 
@@ -464,20 +448,15 @@ impl FullPolytope {
             });
     }
 
-    fn essential_polytope(&self) -> Result<Option<Polytope>> {
+    fn essential_polytope(&self) -> Result<Option<EssentialPolytope>> {
         let essential = self.essential_indices.as_ref().and_then(|indices| {
             self.adjacency.as_ref().map(|adjacency| {
                 let mut mapping: HashMap<usize, usize> = HashMap::new();
                 for (essential, raw) in indices.iter().enumerate() {
                     mapping.insert(*raw, essential);
                 }
-                let dim = self.vertices.first().map_or(0, |f| f.len());
-                let mut essential_vertices = Array2::<f64>::zeros((dim, indices.len()));
-                for i in indices {
-                    for j in 0..dim {
-                        essential_vertices[[j, mapping[i]]] = self.vertices[*i][j];
-                    }
-                }
+                let indices_as_slice = indices.iter().map(|i| *i).collect::<Vec<_>>();
+                let essential_vertices = self.vertices.select(Axis(0), &indices_as_slice);
                 let mut essential_adjacency: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
                 for (vertex, neighbours) in adjacency {
                     essential_adjacency.insert(
@@ -488,14 +467,15 @@ impl FullPolytope {
                 (essential_vertices, essential_adjacency)
             })
         });
-        let poly: Option<Result<Polytope>> = essential.map(|(vertices, adjacency)| {
+        let poly: Option<Result<EssentialPolytope>> = essential.map(|(vertices, adjacency)| {
             let mut edges: Vec<Array1<f64>> = Vec::new();
             let mut flattened_adjacency: Vec<(usize, usize)> = Vec::new();
+            debug!("Adjacency {:?}", flattened_adjacency);
             debug!("Vertices shape {:?}", vertices.shape());
             for (current_vertex, neighbours) in &adjacency {
                 for neighbour in neighbours {
-                    let edge = &vertices.index_axis(Axis(1), *current_vertex)
-                        - &vertices.index_axis(Axis(1), *neighbour);
+                    let edge = &vertices.index_axis(Axis(0), *current_vertex)
+                        - &vertices.index_axis(Axis(0), *neighbour);
                     edges.push(edge);
                     flattened_adjacency.push((*current_vertex, *neighbour));
                 }
@@ -507,6 +487,7 @@ impl FullPolytope {
                     return e.view().into_shape((1, dim));
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            debug!("edges {:?}", expanded_dims);
             let mut edge_array: Array2<f64> = ndarray::concatenate(Axis(0), &expanded_dims)?;
             let vec_adjacency = adjacency
                 .iter()
@@ -519,14 +500,14 @@ impl FullPolytope {
                 let norm = l2_norm(row_slice);
                 row.mapv_inplace(|v| v / norm);
             }
-            let polytope = Polytope {
+            let polytope = EssentialPolytope {
                 adjacency: vec_adjacency,
                 vertices: vertices,
                 flattened_adjacency,
                 edges: edge_array,
             };
 
-            fn test_polytope(poly: &Polytope) -> bool {
+            fn test_polytope(poly: &EssentialPolytope) -> bool {
                 let mut correct = true;
                 let mut flat_index: usize = 0;
                 for (vertex, neighbours) in poly.adjacency.iter().enumerate() {
@@ -545,7 +526,7 @@ impl FullPolytope {
     }
 
     // Map the essential indices back to full polytope raw indices before exporting
-    fn map_essential_index(self: &FullPolytope, index: usize) -> Option<usize> {
+    fn map_essential_index(self: &Polytope, index: usize) -> Option<usize> {
         return self.essential_indices.as_ref().and_then(|m| {
             m.iter()
                 .enumerate()
@@ -559,7 +540,7 @@ impl FullPolytope {
     }
 }
 
-fn mink_sum_setup<'a>(poly_list: &mut [FullPolytope]) -> Result<ReverseSearchState> {
+fn mink_sum_setup<'a>(poly_list: &mut [Polytope]) -> Result<ReverseSearchState> {
     for poly in poly_list.as_mut() {
         poly.fill_essential()?;
         poly.fill_adjacency()?;
@@ -577,7 +558,7 @@ fn mink_sum_setup<'a>(poly_list: &mut [FullPolytope]) -> Result<ReverseSearchSta
 
     let dim = polys_ref
         .first()
-        .map(|p| p.vertices.shape()[0])
+        .map(|p| p.vertices.shape()[1])
         .ok_or(anyhow!("No polytopes!"))?;
 
     let initial_param = Array1::<f64>::ones(dim);
@@ -592,7 +573,7 @@ fn mink_sum_setup<'a>(poly_list: &mut [FullPolytope]) -> Result<ReverseSearchSta
         ties = false;
         for (i, polytope) in state.polys.iter().enumerate() {
             debug!("Testing polytope {} for ties with initial param", i);
-            let scores = state.param.dot(&polytope.vertices);
+            let scores = state.param.dot(&polytope.vertices.t());
             let mut prev_best = *scores.first().unwrap_or(&0.0);
             let mut best_count = 1;
             for score in scores.to_vec()[1..].iter() {
@@ -665,7 +646,7 @@ fn decomp_iter<'a>(
 }
 
 pub fn reverse_search<'a>(
-    poly_list: &mut [FullPolytope],
+    poly_list: &mut [Polytope],
     mut writer: Box<dyn FnMut(ReverseSearchOut) -> Result<()> + 'a>,
 ) -> Result<()> {
     let initial_state = mink_sum_setup(poly_list)?;
@@ -781,7 +762,7 @@ pub fn reverse_search<'a>(
         }
 
         fn test_maximiser(
-            polys: &[Polytope],
+            polys: &[EssentialPolytope],
             decomp: impl Iterator<Item = usize>,
             maximiser: &Array1<f64>,
         ) -> Result<bool> {
