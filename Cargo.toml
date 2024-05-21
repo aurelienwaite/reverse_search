@@ -14,7 +14,7 @@ include = [
 
 [lib]
 name = "reverse_search"
-path = "src/reverse_search.rs"
+path = "src/lib.rs"
 
 [dependencies]
 good_lp = { version = "1.7.0", features = ["clarabel"], default-features = false }
@@ -25,3 +25,4 @@ ndarray = { version = "0.15.6", features = ["serde"] }
 ndarray-rand = "0.14.0"
 ndarray-stats = "0.5.1"
 itertools = "0.12.1"
+instant = { version = "0.1", features = [ "wasm-bindgen" ] }
