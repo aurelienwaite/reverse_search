@@ -67,6 +67,19 @@ fn tree_index_iter<'a>(
     }
 }
 
+pub fn accuracy(decomp: &[usize], labels: &[usize]) -> f32 {
+    let matches: f32 = decomp
+        .iter()
+        .zip_eq(labels)
+        .map(|(h, l)| if h == l { 1_f32 } else { 0_f32 })
+        .sum();
+    // Connfident that these won't overflow
+    let len_downsize: i16 = decomp.len().try_into().unwrap();
+    let len_float: f32 = len_downsize.try_into().unwrap();
+    (matches / len_float) * 100.
+}
+
+
 impl Node {
     pub fn new() -> Self {
         Node {

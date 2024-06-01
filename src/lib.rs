@@ -27,7 +27,7 @@ enum InteriorPointSolution {
     Infeasible,
 }
 
-pub enum ReverseSearchIterationResult {
+pub enum StepResult {
     Nonadjacent,
     NotAChild,
     Child(Array1<f64>),
@@ -47,18 +47,6 @@ impl TreeIndex {
             vertex_id,
         }
     }
-}
-
-pub fn accuracy(decomp: &[usize], labels: &[usize]) -> f32 {
-    let matches: f32 = decomp
-        .iter()
-        .zip_eq(labels)
-        .map(|(h, l)| if h == l { 1_f32 } else { 0_f32 })
-        .sum();
-    // Connfident that these won't overflow
-    let len_downsize: i16 = decomp.len().try_into().unwrap();
-    let len_float: f32 = len_downsize.try_into().unwrap();
-    (matches / len_float) * 100.
 }
 
 // Cannot use linalg on wasm because of BLAS. Build our own l2_norm function.
@@ -276,50 +264,50 @@ fn find_essential(
 }
 
 #[derive(Clone)]
-struct ReverseSearchState<'a> {
+struct State<'a> {
     param: Array1<f64>,
     neighbour_index: usize,
     polys: &'a [EssentialPolytope],
-    tree_history: TreeHistory,
+    node: TreeNode,
 }
 
 #[derive(Clone)]
-struct TreeHistory {
+struct TreeNode {
     // The Vertex in the tree index is a function of polytope index and the minkowski decomp.
     // We cache it in the state to make keeping track of diffs easier.
     // It must be kept in sync with the minkowski decomp
-    tree_node: TreeIndex,
-    previous_tree_node: TreeIndex,
+    current: TreeIndex,
+    previous: TreeIndex,
 }
 
-impl ReverseSearchState<'_> {
+impl State<'_> {
     fn new<'a>(
         param: Array1<f64>,
         polys: &'a [EssentialPolytope],
-    ) -> Result<ReverseSearchState<'a>> {
+    ) -> Result<State<'a>> {
         let vertex = polys[0].maximised_vertex(&param)?;
-        let state = ReverseSearchState {
+        let state = State {
             param,
             neighbour_index: 0,
             polys: polys,
-            tree_history: TreeHistory {
-                tree_node: TreeIndex::new(0, vertex),
-                previous_tree_node: TreeIndex::new(0, vertex),
+            node: TreeNode {
+                current: TreeIndex::new(0, vertex),
+                previous: TreeIndex::new(0, vertex),
             },
         };
         Ok(state)
     }
 
     fn polytope(&self) -> &EssentialPolytope {
-        return &self.polys[self.tree_history.tree_node.polytope_id];
+        return &self.polys[self.node.current.polytope_id];
     }
 
     fn neighbours(&self) -> &Vec<usize> {
-        return &self.polytope().adjacency[self.tree_history.tree_node.vertex_id];
+        return &self.polytope().adjacency[self.node.current.vertex_id];
     }
 
     fn complete(&self) -> bool {
-        return self.tree_history.tree_node.polytope_id >= self.polys.len();
+        return self.node.current.polytope_id >= self.polys.len();
     }
 
     fn test_vertex(&self) -> usize {
@@ -329,11 +317,11 @@ impl ReverseSearchState<'_> {
     fn incr_state(mut self, minkowski_decomp: &Vec<usize>) -> Self {
         self.neighbour_index += 1;
         if self.neighbour_index >= self.neighbours().len() {
-            self.tree_history.tree_node.polytope_id += 1;
+            self.node.current.polytope_id += 1;
             self.neighbour_index = 0;
             if !self.complete() {
-                self.tree_history.tree_node.vertex_id =
-                    minkowski_decomp[self.tree_history.tree_node.polytope_id];
+                self.node.current.vertex_id =
+                    minkowski_decomp[self.node.current.polytope_id];
             }
         };
         self
@@ -652,19 +640,19 @@ fn decomp_iter<'a>(
     })
 }
 
-pub struct Generator {
+pub struct Searcher {
     polys: Vec<EssentialPolytope>,
     initial_decomp: Vec<usize>,
     pub minkowski_decomp: Vec<usize>,
     initial_param: Array1<f64>,
 }
 
-impl Generator {
+impl Searcher {
     fn setup_reverse_search(poly_list: &mut [Polytope]) -> Result<Self> {
         let (polys, initial_param) = setup(poly_list)?;
         let initial_decomp = minkowski_decomp(&polys, &initial_param)?;
 
-        Ok(Generator {
+        Ok(Searcher {
             polys,
             minkowski_decomp: initial_decomp.clone(),
             initial_decomp,
@@ -672,11 +660,11 @@ impl Generator {
         })
     }
 
-    pub fn generate(
+    pub fn step(
         &self,
         prev_index: &TreeIndex,
         test_vertex: usize,
-    ) -> Result<ReverseSearchIterationResult> {
+    ) -> Result<StepResult> {
         let mut edges: Vec<ArrayView2<f64>> = Vec::new();
         let mut test_edge: Option<(usize, ArrayView1<f64>)> = None;
         let mut edge_counter: usize = 0;
@@ -707,7 +695,7 @@ impl Generator {
         debug!("Adjacency computation took {}ms", now.elapsed().as_millis());
         if !is_adjacent {
             debug!("Skipping because edge is not adjacent");
-            return Ok(ReverseSearchIterationResult::Nonadjacent);
+            return Ok(StepResult::Nonadjacent);
         }
 
         let test_decomp_index = DecompositionIndex::new(prev_index.polytope_id, test_vertex);
@@ -715,7 +703,7 @@ impl Generator {
 
         if test_iter().eq(self.initial_decomp.iter()) {
             debug!("Reached the initial state. Loop complete");
-            return Ok(ReverseSearchIterationResult::LoopComplete);
+            return Ok(StepResult::LoopComplete);
         }
 
         //rebuild edges for new cone
@@ -815,9 +803,9 @@ impl Generator {
             && self.minkowski_decomp[parent_decomp_index.polytope_index]
                 == parent_decomp_index.vertex
         {
-            ReverseSearchIterationResult::Child(maximiser_norm)
+            StepResult::Child(maximiser_norm)
         } else {
-            ReverseSearchIterationResult::Nonadjacent
+            StepResult::Nonadjacent
         };
 
         Ok(step_result)
@@ -833,11 +821,11 @@ pub fn reverse_search<'a>(
         poly.fill_essential()?;
         poly.fill_adjacency()?;
     }
-    let mut search = Generator::setup_reverse_search(poly_list)?;
-    let initial_state: ReverseSearchState =
-        ReverseSearchState::new(search.initial_param.clone(), &search.polys)?;
+    let mut search = Searcher::setup_reverse_search(poly_list)?;
+    let initial_state: State =
+        State::new(search.initial_param.clone(), &search.polys)?;
 
-    let mut stack: Vec<ReverseSearchState> = Vec::new();
+    let mut stack: Vec<State> = Vec::new();
     stack.push(initial_state.clone());
 
     while !stack.is_empty() {
@@ -848,52 +836,52 @@ pub fn reverse_search<'a>(
             if state.complete() {
                 debug!(
                     "Popping, restoring element {} to {}",
-                    state.tree_history.previous_tree_node.polytope_id,
-                    state.tree_history.previous_tree_node.vertex_id
+                    state.node.previous.polytope_id,
+                    state.node.previous.vertex_id
                 );
-                search.minkowski_decomp[state.tree_history.previous_tree_node.polytope_id] =
-                    state.tree_history.previous_tree_node.vertex_id;
+                search.minkowski_decomp[state.node.previous.polytope_id] =
+                    state.node.previous.vertex_id;
                 continue;
             }
             debug!(
                 "Starting state: polytope {} vertex {} neighbour counter {}",
-                state.tree_history.tree_node.polytope_id,
-                state.tree_history.tree_node.vertex_id,
+                state.node.current.polytope_id,
+                state.node.current.vertex_id,
                 state.neighbour_index
             );
 
             let test_vertex = state.test_vertex();
 
-            match search.generate(&state.tree_history.tree_node, test_vertex)? {
-                ReverseSearchIterationResult::Nonadjacent => {
+            match search.step(&state.node.current, test_vertex)? {
+                StepResult::Nonadjacent => {
                     debug!("Skipping because edge is not adjacent");
                     stack.push(state.incr_state(&search.minkowski_decomp));
                 }
-                ReverseSearchIterationResult::LoopComplete => {
+                StepResult::LoopComplete => {
                     debug!("Reached the initial state. Loop complete");
                     stack.push(state.incr_state(&search.minkowski_decomp));
                 }
-                ReverseSearchIterationResult::NotAChild => {
+                StepResult::NotAChild => {
                     debug!("Adjacency passed but previous node is not a parent");
                     stack.push(state.incr_state(&search.minkowski_decomp));
                 }
-                ReverseSearchIterationResult::Child(param) => {
+                StepResult::Child(param) => {
                     // Reverse traverse
-                    let initial_vertex = if state.tree_history.tree_node.polytope_id == 0 {
+                    let initial_vertex = if state.node.current.polytope_id == 0 {
                         state.test_vertex()
                     } else {
                         search.minkowski_decomp[0]
                     };
-                    let child_state = ReverseSearchState {
+                    let child_state = State {
                         param,
                         polys: state.polys,
                         neighbour_index: 0,
-                        tree_history: TreeHistory {
-                            tree_node: TreeIndex::new(0, initial_vertex),
-                            previous_tree_node: state.tree_history.tree_node.clone(),
+                        node: TreeNode {
+                            current: TreeIndex::new(0, initial_vertex),
+                            previous: state.node.current.clone(),
                         },
                     };
-                    let test_polytope_index = state.tree_history.tree_node.polytope_id;
+                    let test_polytope_index = state.node.current.polytope_id;
                     let incr = state.incr_state(&search.minkowski_decomp);
                     search.minkowski_decomp[test_polytope_index] = test_vertex;
                     stack.push(incr);
