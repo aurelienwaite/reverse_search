@@ -13,6 +13,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::usize;
 
+mod search;
+
 // Used for the LP separation problem. Due to the formalisation of the LP the number will always
 // be in the range [0,1]. Having a fixed epsilon is probably ok.
 const EPSILON: f64 = 1e-6;
@@ -648,7 +650,7 @@ pub struct Searcher {
 }
 
 impl Searcher {
-    fn setup_reverse_search(poly_list: &mut [Polytope]) -> Result<Self> {
+    fn setup_reverse_search(poly_list: &[Polytope]) -> Result<Self> {
         let (polys, initial_param) = setup(poly_list)?;
         let initial_decomp = minkowski_decomp(&polys, &initial_param)?;
 
