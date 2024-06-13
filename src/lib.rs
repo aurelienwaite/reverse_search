@@ -11,9 +11,15 @@ use ndarray_rand::RandomExt;
 use ndarray_stats::QuantileExt;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::{Read, Write};
 use std::usize;
+use flate2::Compression;
+use flate2::write::ZlibEncoder;
+use flate2::read::ZlibDecoder;
+use bytes::Buf;
+use bytes::buf::Reader;
 
-mod search;
+pub mod guided_search;
 
 // Used for the LP separation problem. Due to the formalisation of the LP the number will always
 // be in the range [0,1]. Having a fixed epsilon is probably ok.
@@ -29,6 +35,7 @@ enum InteriorPointSolution {
     Infeasible,
 }
 
+#[derive(Clone)]
 pub enum StepResult {
     Nonadjacent,
     NotAChild,
@@ -36,7 +43,7 @@ pub enum StepResult {
     LoopComplete,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TreeIndex {
     pub polytope_id: usize,
     pub vertex_id: usize,
@@ -346,6 +353,7 @@ pub struct Polytope {
 }
 
 // A polytope with essential data only
+#[derive(Clone)]
 struct EssentialPolytope {
     vertices: Array2<f64>, // Transposed - dim x vertices
     flattened_adjacency: Vec<(usize, usize)>,
@@ -387,7 +395,49 @@ impl EssentialPolytope {
 
 pub struct ReverseSearchOut {
     pub param: Array1<f64>,
-    pub minkowski_decomp: Vec<usize>,
+    pub compressed_decomp: Vec<u8>,
+}
+
+impl ReverseSearchOut {
+
+    pub fn encode(param: Array1<f64>, minkowski_decomp: impl Iterator<Item = usize>) -> Result<Self>{
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        for vertex_id in minkowski_decomp{
+            let bytes_representation = vertex_id.to_ne_bytes();
+            encoder.write(&bytes_representation)?;
+        }
+        Ok(ReverseSearchOut{
+            param,
+            compressed_decomp: encoder.finish()?
+        })
+    }
+
+    pub fn minkowski_decomp_iter(& self) -> MinkDecompIter{
+        MinkDecompIter{
+            decoder: ZlibDecoder::new(self.compressed_decomp.reader())
+        } 
+    }
+
+}
+
+pub struct MinkDecompIter<'a> {
+    decoder: ZlibDecoder<Reader<&'a [u8]>>,
+}
+
+impl Iterator for MinkDecompIter<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buf = [0u8; std::mem::size_of::<usize>()];
+        let read_res = self.decoder.read(&mut buf);
+        read_res.ok().and_then(|num_read|{
+            if num_read != buf.len() {
+                None
+            }else{
+                Some(usize::from_ne_bytes(buf))
+            }
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -452,7 +502,12 @@ impl Polytope {
             });
     }
 
-    fn essential_polytope(&self) -> Result<Option<EssentialPolytope>> {
+    pub fn fill(&mut self) -> Result<()> {
+        self.fill_essential()?;
+        self.fill_adjacency()
+    }
+
+    fn essential_polytope(&self) -> Option<EssentialPolytope> {
         let essential = self.essential_indices.as_ref().and_then(|indices| {
             self.adjacency.as_ref().map(|adjacency| {
                 let mut mapping: HashMap<usize, usize> = HashMap::new();
@@ -471,7 +526,7 @@ impl Polytope {
                 (essential_vertices, essential_adjacency)
             })
         });
-        let poly: Option<Result<EssentialPolytope>> = essential.map(|(vertices, adjacency)| {
+        let poly: Option<EssentialPolytope> = essential.map(|(vertices, adjacency)| {
             let mut edges: Vec<Array1<f64>> = Vec::new();
             let mut flattened_adjacency: Vec<(usize, usize)> = Vec::new();
             for (current_vertex, neighbours) in &adjacency {
@@ -486,10 +541,10 @@ impl Polytope {
                 .iter()
                 .map(|e| {
                     let dim = e.shape()[0];
-                    return e.view().into_shape((1, dim));
+                    return e.view().into_shape((1, dim)).expect("Cannot reshape array");
                 })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut edge_array: Array2<f64> = ndarray::concatenate(Axis(0), &expanded_dims)?;
+                .collect::<Vec<_>>();
+            let mut edge_array: Array2<f64> = ndarray::concatenate(Axis(0), &expanded_dims).expect("Cannot concat edges");
             let vec_adjacency = adjacency
                 .iter()
                 .map(|(_vertex, neighbours)| neighbours.iter().map(|n| *n).collect::<Vec<_>>())
@@ -497,7 +552,7 @@ impl Polytope {
             for mut row in edge_array.rows_mut() {
                 let row_slice = row
                     .as_slice()
-                    .ok_or(anyhow!("Incorrect memory layout in edges"))?;
+                    .expect("Incorrect memory layout in edges");
                 let norm = l2_norm(row_slice);
                 row.mapv_inplace(|v| v / norm);
             }
@@ -521,9 +576,9 @@ impl Polytope {
                 correct
             }
             debug_assert!(test_polytope(&polytope));
-            return Ok(polytope);
+            return polytope;
         });
-        return poly.transpose();
+        return poly;
     }
 
     // Map the essential indices back to full polytope raw indices before exporting
@@ -545,7 +600,7 @@ fn setup(poly_list: &[Polytope]) -> Result<(Vec<EssentialPolytope>, Array1<f64>)
     let essential_polys = poly_list
         .iter()
         .map(|p| p.essential_polytope())
-        .collect::<Result<Vec<_>, _>>()?
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|p| p.ok_or(anyhow!("No item")))
         .collect::<Result<Vec<_>, _>>()?;
@@ -642,6 +697,7 @@ fn decomp_iter<'a>(
     })
 }
 
+#[derive(Clone)]
 pub struct Searcher {
     polys: Vec<EssentialPolytope>,
     initial_decomp: Vec<usize>,
@@ -650,7 +706,7 @@ pub struct Searcher {
 }
 
 impl Searcher {
-    fn setup_reverse_search(poly_list: &[Polytope]) -> Result<Self> {
+    pub fn setup_reverse_search(poly_list: &[Polytope]) -> Result<Self> {
         let (polys, initial_param) = setup(poly_list)?;
         let initial_decomp = minkowski_decomp(&polys, &initial_param)?;
 
@@ -662,7 +718,7 @@ impl Searcher {
         })
     }
 
-    pub fn step(
+    fn step(
         &self,
         prev_index: &TreeIndex,
         test_vertex: usize,
@@ -888,19 +944,17 @@ pub fn reverse_search<'a>(
                     search.minkowski_decomp[test_polytope_index] = test_vertex;
                     stack.push(incr);
 
-                    // TODO: Fix the writing code to take references to decompositions, allowing for deletion of this clone
-                    let output_decomp = search.minkowski_decomp.clone();
-                    let mut output = ReverseSearchOut {
-                        param: child_state.param.clone(),
-                        minkowski_decomp: output_decomp,
-                    };
-                    for (vertex, full_poly) in
-                        output.minkowski_decomp.iter_mut().zip(poly_list.as_ref())
-                    {
-                        *vertex = full_poly
+                    let mapped_iter = search.minkowski_decomp.iter().zip(poly_list.as_ref()).map(
+                        |(vertex, full_poly)| {
+                        full_poly
                             .map_essential_index(*vertex)
-                            .ok_or(anyhow!("Essential vertex not found!"))?;
-                    }
+                            .expect("Essential vertex not found!")
+                        }
+                    );
+                    let output = ReverseSearchOut::encode(
+                        child_state.param.clone(),
+                        mapped_iter,
+                    )?;
                     writer(output)?;
                     stack.push(child_state);
                 }
