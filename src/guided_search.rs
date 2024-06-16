@@ -201,9 +201,10 @@ pub struct Guide {
     labels: Vec<usize>,
     rng: Cell<Option<SmallRng>>,
     root: Cell<Node>,
+    //executor: Rc<Box<dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>> + 'a>> +'a>>
 }
 
-impl Guide {
+impl<'a> Guide {
     pub fn new(
         searcher: &Searcher,
         labels: &[usize],
@@ -218,12 +219,13 @@ impl Guide {
             labels: labels.to_owned(),
             rng: Cell::new(Some(rng)),
             root: Cell::new(Node::new()),
-
+            //executor
         })
     }
 
+
     // Run a single iteration of guided search. Note that this is not thread safe!
-    pub async fn guided_search<'a>(&self, executor: Rc<impl Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>>>>>) -> Result<Option<ReverseSearchOut>> {
+    pub async fn guided_search(& self, executor: Rc<Box<dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>> + 'a>> +'a>>)  -> Result<Option<ReverseSearchOut>> {
         let scoring_fn = |to_score: &mut dyn Iterator<Item = usize>| {
             let res: usize = to_score
                 .zip_eq(&self.labels)
