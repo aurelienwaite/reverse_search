@@ -3,21 +3,20 @@ use crate::{Polytope, Searcher, TreeIndex};
 use anyhow::{anyhow, Result};
 use bit_set::BitSet;
 use core::future::Future;
-use std::rc::Rc;
 use itertools::Itertools;
+use log::{debug, info};
 use rand::prelude::SeedableRng;
 use rand::prelude::*;
+use std::cell::Cell;
 use std::cmp::Ord;
 use std::cmp::Ordering;
 use std::collections::hash_map::Iter as MapIter;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
+use std::rc::Rc;
 use std::usize;
-use log::{debug, info};
-use std::cell::Cell;
 
-pub type Executor<'a> =
-    dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>>>>;
+pub type Executor<'a> = dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>>>>;
 
 #[derive(Default)]
 pub struct Node {
@@ -124,7 +123,6 @@ impl Node {
             .unwrap_or(false)
     }
 
-
     // Find best candidate for next search state
     pub fn score<'a>(
         &'a self,
@@ -164,15 +162,20 @@ impl Node {
                 }
             }
         }
-        paths_by_score.sort_by(|left: &(usize, usize, &[TreeIndex]), right| match left.0.cmp(&right.0) {
-            Ordering::Equal => right.1.cmp(&left.1),
-            ordering => ordering,
+        paths_by_score.sort_by(|left: &(usize, usize, &[TreeIndex]), right| {
+            match left.0.cmp(&right.0) {
+                Ordering::Equal => right.1.cmp(&left.1),
+                ordering => ordering,
+            }
         });
-        paths_by_score.iter().map(|(_s, _e, path)| *path).collect_vec()
+        paths_by_score
+            .iter()
+            .map(|(_s, _e, path)| *path)
+            .collect_vec()
     }
 }
 
-pub fn search_wrapper(searcher: & mut Searcher, path: Vec<TreeIndex>) -> Result<StepResult> {
+pub fn search_wrapper(searcher: &mut Searcher, path: Vec<TreeIndex>) -> Result<StepResult> {
     let to_test = path
         .last()
         .ok_or(anyhow!("Cannot search with empty path"))?;
@@ -205,11 +208,7 @@ pub struct Guide {
 }
 
 impl<'a> Guide {
-    pub fn new(
-        searcher: &Searcher,
-        labels: &[usize],
-        seed: Option<u64>,
-    ) -> Result<Self> {
+    pub fn new(searcher: &Searcher, labels: &[usize], seed: Option<u64>) -> Result<Self> {
         let rng = seed.map_or(SmallRng::from_entropy(), |seed| {
             SmallRng::seed_from_u64(seed)
         });
@@ -223,9 +222,16 @@ impl<'a> Guide {
         })
     }
 
-
     // Run a single iteration of guided search. Note that this is not thread safe!
-    pub async fn guided_search(& self, executor: Rc<Box<dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>> + 'a>> +'a>>)  -> Result<Option<ReverseSearchOut>> {
+    pub async fn guided_search(
+        &self,
+        executor: Rc<
+            Box<
+                dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>> + 'a>>
+                    + 'a,
+            >,
+        >,
+    ) -> Result<Option<ReverseSearchOut>> {
         let scoring_fn = |to_score: &mut dyn Iterator<Item = usize>| {
             let res: usize = to_score
                 .zip_eq(&self.labels)
@@ -237,12 +243,12 @@ impl<'a> Guide {
         {
             let root = self.root.take();
             // Do all the immutable processing in it's own scope
-            let mut scored_nodes =
-                root
-                .score(&self.minkowski_decomp, scoring_fn);
+            let mut scored_nodes = root.score(&self.minkowski_decomp, scoring_fn);
 
             let make_candidates = |best_nodepath: Option<&[TreeIndex]>| {
-                let best_node = root.get_node(best_nodepath.ok_or(anyhow!("No scored nodes!"))?).ok_or(anyhow!("Path doesn't find node. Should never happen"))?;
+                let best_node = root
+                    .get_node(best_nodepath.ok_or(anyhow!("No scored nodes!"))?)
+                    .ok_or(anyhow!("Path doesn't find node. Should never happen"))?;
                 let candidates = || {
                     tree_index_iter(&self.minkowski_decomp, &best_node.path)
                         .enumerate()
@@ -281,35 +287,46 @@ impl<'a> Guide {
             to_test.push(selection.clone());
             self.root.set(root);
         }
-        let mut root = self.root.take();
-        let mut_node = 
-            root
-            .get_node_mut(&to_test[..to_test.len() - 1])
-            .ok_or(anyhow!("Can't find best node!"))?;
 
         let test_selection = to_test.last().unwrap();
-        mut_node.testing.insert(test_selection.clone());
+        {
+            // Moving each root take into a separate scope to make it clear that we're borrowing
+            let mut root = self.root.take();
+            let mut_node = root
+                .get_node_mut(&to_test[..to_test.len() - 1])
+                .ok_or(anyhow!("Can't find best node!"))?;
+            mut_node.testing.insert(test_selection.clone());
+            self.root.set(root);
+        }
         let step_result = (executor)(to_test.clone()).await;
-        mut_node.testing.remove(test_selection);
+        let result;
+        {
+            // Need a new scope because this executes after the await
+            let mut root = self.root.take();
+            let mut_node = root
+                .get_node_mut(&to_test[..to_test.len() - 1])
+                .ok_or(anyhow!("Can't find best node!"))?;
+            mut_node.testing.remove(test_selection);
 
-        let mut mark_nonadj = || {
-            mut_node.mark_nonadjacent(test_selection.polytope_id, test_selection.vertex_id);
-            Option::<ReverseSearchOut>::None
-        };
+            let mut mark_nonadj = || {
+                mut_node.mark_nonadjacent(test_selection.polytope_id, test_selection.vertex_id);
+                Option::<ReverseSearchOut>::None
+            };
 
-        let result = match step_result? {
-            StepResult::Child(param) => {
-                mut_node.make_child(test_selection.polytope_id, test_selection.vertex_id);
-                Some(ReverseSearchOut::encode(
-                    param,
-                    tree_index_iter(&self.minkowski_decomp, &to_test),
-                )?)
-            }
-            StepResult::Nonadjacent => mark_nonadj(),
-            StepResult::NotAChild => mark_nonadj(),
-            StepResult::LoopComplete => mark_nonadj(),
-        };
-        self.root.set(root);
+            result = match step_result? {
+                StepResult::Child(param) => {
+                    mut_node.make_child(test_selection.polytope_id, test_selection.vertex_id);
+                    Some(ReverseSearchOut::encode(
+                        param,
+                        tree_index_iter(&self.minkowski_decomp, &to_test),
+                    )?)
+                }
+                StepResult::Nonadjacent => mark_nonadj(),
+                StepResult::NotAChild => mark_nonadj(),
+                StepResult::LoopComplete => mark_nonadj(),
+            };
+            self.root.set(root);
+        }
 
         Ok(result)
     }
