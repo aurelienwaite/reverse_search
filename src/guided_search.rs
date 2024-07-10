@@ -18,7 +18,6 @@ use std::usize;
 
 pub type Executor<'a> = dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>>>>;
 
-#[derive(Default)]
 pub struct Node {
     path: Vec<TreeIndex>,
     // Cached value from the reverse search. If an adjacent state
@@ -203,7 +202,7 @@ pub struct Guide {
     polys: Vec<EssentialPolytope>,
     labels: Vec<usize>,
     rng: Cell<Option<SmallRng>>,
-    root: Cell<Node>,
+    root: Cell<Option<Node>>,
     //executor: Rc<Box<dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>> + 'a>> +'a>>
 }
 
@@ -217,7 +216,7 @@ impl<'a> Guide {
             polys: searcher.polys.to_owned(),
             labels: labels.to_owned(),
             rng: Cell::new(Some(rng)),
-            root: Cell::new(Node::new()),
+            root: Cell::new(Some(Node::new())),
             //executor
         })
     }
@@ -241,14 +240,22 @@ impl<'a> Guide {
         };
         let mut to_test: Vec<TreeIndex>;
         {
-            let root = self.root.take();
+            let root = self.root.take().unwrap();
             // Do all the immutable processing in it's own scope
             let mut scored_nodes = root.score(&self.minkowski_decomp, scoring_fn);
 
             let make_candidates = |best_nodepath: Option<&[TreeIndex]>| {
-                let best_node = root
-                    .get_node(best_nodepath.ok_or(anyhow!("No scored nodes!"))?)
-                    .ok_or(anyhow!("Path doesn't find node. Should never happen"))?;
+                let best_node_res =
+                    best_nodepath
+                        .ok_or(anyhow!("No scored nodes!"))
+                        .and_then(|unwrapped_path| {
+                            root.get_node(unwrapped_path)
+                                .ok_or(anyhow!("Path doesn't find node. Should never happen"))
+                        });
+                let best_node = match best_node_res {
+                    Ok(best_node) => best_node,
+                    Err(err) => return Err(err),
+                };
                 let candidates = || {
                     tree_index_iter(&self.minkowski_decomp, &best_node.path)
                         .enumerate()
@@ -276,7 +283,13 @@ impl<'a> Guide {
 
             let (mut best_node, mut to_search) = make_candidates(scored_nodes.pop())?;
             while to_search.len() == 0 {
-                (best_node, to_search) = make_candidates(scored_nodes.pop())?;
+                (best_node, to_search) = match make_candidates(scored_nodes.pop()) {
+                    Ok(candidate) => candidate,
+                    Err(err) => {
+                        self.root.set(Some(root));
+                        return Err(err);
+                    },
+                };
             }
 
             let mut rng = self.rng.take().unwrap();
@@ -285,24 +298,25 @@ impl<'a> Guide {
             let selection = &to_search[selection_index];
             to_test = best_node.path.clone();
             to_test.push(selection.clone());
-            self.root.set(root);
+            self.root.set(Some(root));
         }
 
         let test_selection = to_test.last().unwrap();
         {
             // Moving each root take into a separate scope to make it clear that we're borrowing
-            let mut root = self.root.take();
+            let mut root = self.root.take().unwrap();
             let mut_node = root
                 .get_node_mut(&to_test[..to_test.len() - 1])
                 .ok_or(anyhow!("Can't find best node!"))?;
             mut_node.testing.insert(test_selection.clone());
-            self.root.set(root);
+            self.root.set(Some(root));
         }
         let step_result = (executor)(to_test.clone()).await;
+        debug!("Got result, continuing processing");
         let result;
         {
             // Need a new scope because this executes after the await
-            let mut root = self.root.take();
+            let mut root = self.root.take().unwrap();
             let mut_node = root
                 .get_node_mut(&to_test[..to_test.len() - 1])
                 .ok_or(anyhow!("Can't find best node!"))?;
@@ -325,9 +339,12 @@ impl<'a> Guide {
                 StepResult::NotAChild => mark_nonadj(),
                 StepResult::LoopComplete => mark_nonadj(),
             };
-            self.root.set(root);
+            self.root.set(Some(root));
         }
-
+        let root = self.root.take();
+        assert!(root.is_some());
+        debug!("Root ok");
+        self.root.set(root);
         Ok(result)
     }
 }
