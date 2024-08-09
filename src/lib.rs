@@ -359,6 +359,7 @@ struct EssentialPolytope {
     flattened_adjacency: Vec<(usize, usize)>,
     edges: Array2<f64>,
     adjacency: Vec<Vec<usize>>,
+    mapping: HashMap<usize, usize>, // Maps essential to raw indices
 }
 
 impl EssentialPolytope {
@@ -510,23 +511,23 @@ impl Polytope {
     fn essential_polytope(&self) -> Option<EssentialPolytope> {
         let essential = self.essential_indices.as_ref().and_then(|indices| {
             self.adjacency.as_ref().map(|adjacency| {
-                let mut mapping: HashMap<usize, usize> = HashMap::new();
+                let mut inverse_mapping: HashMap<usize, usize> = HashMap::new();
                 for (essential, raw) in indices.iter().enumerate() {
-                    mapping.insert(*raw, essential);
+                    inverse_mapping.insert(*raw, essential);
                 }
                 let indices_as_slice = indices.iter().map(|i| *i).collect::<Vec<_>>();
                 let essential_vertices = self.vertices.select(Axis(0), &indices_as_slice);
                 let mut essential_adjacency: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
                 for (vertex, neighbours) in adjacency {
                     essential_adjacency.insert(
-                        mapping[&vertex],
-                        neighbours.iter().map(|i| mapping[i]).collect(),
+                        inverse_mapping[&vertex],
+                        neighbours.iter().map(|i| inverse_mapping[i]).collect(),
                     );
                 }
-                (essential_vertices, essential_adjacency)
+                (essential_vertices, essential_adjacency, inverse_mapping)
             })
         });
-        let poly: Option<EssentialPolytope> = essential.map(|(vertices, adjacency)| {
+        let poly: Option<EssentialPolytope> = essential.map(|(vertices, adjacency, inverse_mapping)| {
             let mut edges: Vec<Array1<f64>> = Vec::new();
             let mut flattened_adjacency: Vec<(usize, usize)> = Vec::new();
             for (current_vertex, neighbours) in &adjacency {
@@ -556,11 +557,16 @@ impl Polytope {
                 let norm = l2_norm(row_slice);
                 row.mapv_inplace(|v| v / norm);
             }
+            let mut mapping: HashMap<usize, usize> = HashMap::new();
+            for (raw, essential) in inverse_mapping.iter(){
+                mapping.insert(*essential, *raw);
+            }
             let polytope = EssentialPolytope {
                 adjacency: vec_adjacency,
                 vertices: vertices,
                 flattened_adjacency,
                 edges: edge_array,
+                mapping
             };
 
             fn test_polytope(poly: &EssentialPolytope) -> bool {

@@ -1,5 +1,5 @@
 use crate::{EssentialPolytope, ReverseSearchOut, StepResult};
-use crate::{Polytope, Searcher, TreeIndex};
+use crate::{Searcher, TreeIndex};
 use anyhow::{anyhow, Result};
 use bit_set::BitSet;
 use core::future::Future;
@@ -15,6 +15,9 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::usize;
+use ndarray_stats::QuantileExt;
+
+static TOP_K: usize = 100;
 
 pub type Executor<'a> = dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>>>>;
 
@@ -31,8 +34,30 @@ pub struct Node {
 
 struct StackItem<'a> {
     node: &'a Node,
-    reward: f32,
     iterator: MapIter<'a, TreeIndex, Node>,
+}
+
+pub trait Scorer {
+    fn score<'a>(&self, to_score: Box<dyn Iterator<Item = usize> + 'a>) -> f64;
+}
+
+/*
+ * Treat NaNs as less than everything and two NaNs as equal
+ */
+fn float_compare(left: f64, right: f64) -> Ordering {
+    let max_score = f64::max(left, right);
+    if left == right {
+        Ordering::Equal
+    } else if left == max_score {
+        Ordering::Greater
+    } else if right == max_score {
+        debug_assert!(right == max_score);
+        Ordering::Less
+    } else {
+        // Treat two nans as equal
+        assert!(left != left && right != right);
+        Ordering::Equal
+    }
 }
 
 fn tree_index_iter<'a>(
@@ -121,57 +146,6 @@ impl Node {
             .map(|bit_set| bit_set.contains(index.polytope_id))
             .unwrap_or(false)
     }
-
-    // Find best candidate for next search state
-    pub fn score<'a>(
-        &'a self,
-        decomposition: &'a [usize],
-        scorer: impl Fn(&mut (dyn Iterator<Item = usize>)) -> usize,
-    ) -> Vec<&[TreeIndex]> {
-        let mut paths_by_score: Vec<(usize, usize, &[TreeIndex])> = Vec::new();
-        let mut stack: Vec<StackItem> = Vec::new();
-        stack.push(StackItem {
-            node: self,
-            reward: 0.,
-            iterator: self.children.iter(),
-        });
-        while !stack.is_empty() {
-            let mut stack_item = stack.pop().unwrap();
-            let iter_next = stack_item.iterator.next();
-            match iter_next {
-                Some((_, next_node)) => {
-                    stack.push(stack_item);
-                    stack.push(StackItem {
-                        node: next_node,
-                        reward: 0.,
-                        iterator: next_node.children.iter(),
-                    });
-                }
-                None => {
-                    let mut index_iter = tree_index_iter(decomposition, &stack_item.node.path);
-                    let node_score = scorer(&mut index_iter);
-                    let explored = stack_item.node.children.len()
-                        + stack_item
-                            .node
-                            .nonadjacent
-                            .values()
-                            .map(|polytopes| polytopes.len())
-                            .sum::<usize>();
-                    paths_by_score.push((node_score, explored, &stack_item.node.path));
-                }
-            }
-        }
-        paths_by_score.sort_by(|left: &(usize, usize, &[TreeIndex]), right| {
-            match left.0.cmp(&right.0) {
-                Ordering::Equal => right.1.cmp(&left.1),
-                ordering => ordering,
-            }
-        });
-        paths_by_score
-            .iter()
-            .map(|(_s, _e, path)| *path)
-            .collect_vec()
-    }
 }
 
 pub fn search_wrapper(searcher: &mut Searcher, path: Vec<TreeIndex>) -> Result<StepResult> {
@@ -200,25 +174,30 @@ pub fn search_wrapper(searcher: &mut Searcher, path: Vec<TreeIndex>) -> Result<S
 pub struct Guide {
     minkowski_decomp: Vec<usize>,
     polys: Vec<EssentialPolytope>,
-    labels: Vec<usize>,
+    scorer: Rc<dyn Scorer>,
     rng: Cell<Option<SmallRng>>,
     root: Cell<Option<Node>>,
-    //executor: Rc<Box<dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>> + 'a>> +'a>>
+    mappings: Vec<HashMap<usize, usize>>
 }
 
 impl<'a> Guide {
-    pub fn new(searcher: &Searcher, labels: &[usize], seed: Option<u64>) -> Result<Self> {
+    pub fn new(searcher: &Searcher, scorer: Rc<dyn Scorer>, seed: Option<u64>) -> Result<Self> {
         let rng = seed.map_or(SmallRng::from_entropy(), |seed| {
             SmallRng::seed_from_u64(seed)
         });
+        let mappings = searcher.polys.iter().map(|p| p.mapping.clone()).collect_vec();
         Ok(Guide {
             minkowski_decomp: searcher.minkowski_decomp.to_owned(),
             polys: searcher.polys.to_owned(),
-            labels: labels.to_owned(),
+            scorer: scorer,
             rng: Cell::new(Some(rng)),
             root: Cell::new(Some(Node::new())),
-            //executor
+            mappings,
         })
+    }
+
+    pub fn map_polytope_indices<'b>(&'b self, decomp_iter: impl Iterator<Item=usize> + 'b) -> impl Iterator<Item=usize> + 'b{
+        decomp_iter.zip(self.mappings.iter()).map(|(v, mapping)| mapping[&v])
     }
 
     // Run a single iteration of guided search. Note that this is not thread safe!
@@ -231,27 +210,16 @@ impl<'a> Guide {
             >,
         >,
     ) -> Result<Option<ReverseSearchOut>> {
-        let scoring_fn = |to_score: &mut dyn Iterator<Item = usize>| {
-            let res: usize = to_score
-                .zip_eq(&self.labels)
-                .map(|(a, b)| if a == *b { 1usize } else { 0usize })
-                .sum();
-            res
-        };
-        let mut to_test: Vec<TreeIndex>;
+        let to_test: Vec<TreeIndex>;
         {
-            let root = self.root.take().unwrap();
             // Do all the immutable processing in it's own scope
-            let mut scored_nodes = root.score(&self.minkowski_decomp, scoring_fn);
+            let mut scored_nodes = self.score(&self.minkowski_decomp);
 
-            let make_candidates = |best_nodepath: Option<&[TreeIndex]>| {
-                let best_node_res =
-                    best_nodepath
-                        .ok_or(anyhow!("No scored nodes!"))
-                        .and_then(|unwrapped_path| {
-                            root.get_node(unwrapped_path)
-                                .ok_or(anyhow!("Path doesn't find node. Should never happen"))
-                        });
+            let root = self.root.take().unwrap();
+            let make_candidates = |best_nodepath: Vec<TreeIndex>| {
+                let best_node_res = root
+                    .get_node(&best_nodepath)
+                    .ok_or(anyhow!("Path doesn't find node. Should never happen"));
                 let best_node = match best_node_res {
                     Ok(best_node) => best_node,
                     Err(err) => return Err(err),
@@ -270,34 +238,48 @@ impl<'a> Guide {
                                 && !best_node.testing.contains(index)
                         })
                 };
-
-                let filtered_by_labels = candidates()
-                    .filter(|index| self.labels[index.polytope_id] == index.vertex_id)
-                    .collect::<Vec<_>>();
-                Ok::<_, anyhow::Error>(if filtered_by_labels.is_empty() {
-                    (best_node, candidates().collect::<Vec<_>>())
-                } else {
-                    (best_node, filtered_by_labels)
-                })
+                Ok((best_node, candidates().collect::<Vec<_>>()))
             };
 
-            let (mut best_node, mut to_search) = make_candidates(scored_nodes.pop())?;
-            while to_search.len() == 0 {
-                (best_node, to_search) = match make_candidates(scored_nodes.pop()) {
-                    Ok(candidate) => candidate,
+            let mut num_searched = 0usize;
+            let mut merged_candidates: Vec<(Vec<TreeIndex>, f64)> = Vec::new();
+            while let Some(scored_node) = scored_nodes.pop() {
+                if !merged_candidates.is_empty() && num_searched >= TOP_K {
+                    break;
+                }
+                num_searched += 1;
+                let (best_node, to_search) = match make_candidates(scored_node) {
+                    Ok(candidates) => candidates,
                     Err(err) => {
                         self.root.set(Some(root));
                         return Err(err);
-                    },
+                    }
                 };
+                let mut test_path = best_node.path.to_owned();
+                for tree_index in to_search {
+                    test_path.push(tree_index);
+                    let mapped_iter = self.map_polytope_indices(tree_index_iter(&self.minkowski_decomp, &test_path));
+                    let index_iter = Box::new(mapped_iter);
+                    let node_score = self.scorer.score(index_iter);
+                    merged_candidates.push((test_path.to_owned(), node_score));
+                    test_path.pop();
+                }
+            }
+            merged_candidates.sort_by(|left, right| float_compare(left.1, right.1));
+            let best_candidate = merged_candidates.pop().ok_or(anyhow!("No candidates!"))?;
+            let best_score = best_candidate.1;
+            let mut best_candidates = vec![best_candidate.0];
+            while let Some((candidate, score)) = merged_candidates.pop() {
+                if score < best_score {
+                    break;
+                }
+                best_candidates.push(candidate);
             }
 
             let mut rng = self.rng.take().unwrap();
-            let selection_index = (rng.next_u32() as usize) % to_search.len();
+            let selection_index = (rng.next_u32() as usize) % best_candidates.len();
+            to_test = best_candidates[selection_index].to_owned();
             self.rng.set(Some(rng));
-            let selection = &to_search[selection_index];
-            to_test = best_node.path.clone();
-            to_test.push(selection.clone());
             self.root.set(Some(root));
         }
 
@@ -346,5 +328,61 @@ impl<'a> Guide {
         debug!("Root ok");
         self.root.set(root);
         Ok(result)
+    }
+
+    // Find best candidate for next search state
+    pub fn score(&self, decomposition: &'a [usize]) -> Vec<Vec<TreeIndex>> {
+        let mut paths_by_score: Vec<(f64, usize, Vec<TreeIndex>)> = Vec::new();
+        {
+            let mut stack: Vec<StackItem> = Vec::new();
+            let root = self.root.take().unwrap();
+            stack.push(StackItem {
+                node: &root,
+                iterator: (&root).children.iter(),
+            });
+            while !stack.is_empty() {
+                let mut stack_item = stack.pop().unwrap();
+                let iter_next = stack_item.iterator.next();
+                match iter_next {
+                    Some((_, next_node)) => {
+                        stack.push(stack_item);
+                        stack.push(StackItem {
+                            node: next_node,
+                            iterator: next_node.children.iter(),
+                        });
+                    }
+                    None => {
+                        let mapped_iter = self.map_polytope_indices(tree_index_iter(decomposition, &stack_item.node.path));
+                        let index_iter =
+                            Box::new(mapped_iter);
+                        let node_score = self.scorer.score(index_iter);
+                        let explored = stack_item.node.children.len()
+                            + stack_item
+                                .node
+                                .nonadjacent
+                                .values()
+                                .map(|polytopes| polytopes.len())
+                                .sum::<usize>();
+                        paths_by_score.push((
+                            node_score,
+                            explored,
+                            stack_item.node.path.to_owned(),
+                        ));
+                    }
+                }
+            }
+            self.root.set(Some(root));
+        }
+        paths_by_score.sort_by(|left: &(f64, usize, Vec<TreeIndex>), right| {
+            let score_ordering = float_compare(left.0, right.0);
+            match score_ordering {
+                Ordering::Equal => right.1.cmp(&left.1),
+                ordering => ordering,
+            }
+        });
+        paths_by_score
+            .into_iter()
+            .map(|(_s, _e, path)| path)
+            .collect_vec()
     }
 }
