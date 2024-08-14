@@ -17,7 +17,7 @@ use std::rc::Rc;
 use std::usize;
 use ndarray_stats::QuantileExt;
 
-static TOP_K: usize = 100;
+static TOP_K: usize = 1000;
 
 pub type Executor<'a> = dyn Fn(Vec<TreeIndex>) -> Pin<Box<dyn Future<Output = Result<StepResult>>>>;
 

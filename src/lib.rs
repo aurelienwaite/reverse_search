@@ -71,7 +71,14 @@ fn inner_product_lp(coefficients: &ArrayView1<f64>, variables: &[good_lp::Variab
     return coefficients
         .iter()
         .zip_eq(variables)
-        .map(|item| *item.0 * *item.1)
+        .filter_map(|item| {
+            if item.0.abs() > EPSILON {
+                Some(*item.0 * *item.1)
+            } else 
+            {
+                None
+            } 
+        })
         .sum();
 }
 
