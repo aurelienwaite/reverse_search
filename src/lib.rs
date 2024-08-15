@@ -10,7 +10,9 @@ use ndarray_rand::rand_distr::Uniform;
 use ndarray_rand::RandomExt;
 use ndarray_stats::QuantileExt;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::env::var;
+use std::hash::Hash;
 use std::io::{Read, Write};
 use std::usize;
 use flate2::Compression;
@@ -67,19 +69,26 @@ fn l2_norm(to_norm: &[f64]) -> f64 {
         .sqrt()
 }
 
-fn inner_product_lp(coefficients: &ArrayView1<f64>, variables: &[good_lp::Variable]) -> Expression {
-    return coefficients
-        .iter()
-        .zip_eq(variables)
-        .filter_map(|item| {
-            if item.0.abs() > EPSILON {
-                Some(*item.0 * *item.1)
-            } else 
-            {
-                None
-            } 
-        })
-        .sum();
+fn inner_product_lp(coefficients: &ArrayView1<f64>, variables: &HashMap<usize, good_lp::Variable>) -> Expression {
+    return variables.iter().map(|(index, variable)| coefficients[*index] * *variable).sum();
+}
+
+fn array_non_zero_indices(data: &ArrayView1<f64>) -> HashSet<usize>{
+    let mut indices: HashSet<usize> = HashSet::new();
+    for (index, value) in data.indexed_iter(){
+        if value.abs() > EPSILON {
+            indices.insert(index);
+        }
+    }
+    return indices;
+}
+
+fn matrix_non_zero_indices(data: &ArrayView2<f64>) -> HashSet<usize>{
+    let mut indices: HashSet<usize> = HashSet::new();
+    for row in data.rows(){
+        indices.extend(array_non_zero_indices(&row).into_iter());
+    }
+    return indices
 }
 
 fn minkowski_decomp(polys: &[EssentialPolytope], param: &Array1<f64>) -> Result<Vec<usize>> {
@@ -97,11 +106,18 @@ fn lp_separation(
     vertices: &[ArrayView2<f64>], // For efficiency we often want to pass slices of a single matrix. Saves array copies
     linearity: &ArrayView2<f64>,
 ) -> Result<EssentialSolution, ResolutionError> {
+    let mut non_zero_indices = array_non_zero_indices(to_test);
+    for vertex in vertices {
+        non_zero_indices.extend(matrix_non_zero_indices(vertex).into_iter());
+    }
+    non_zero_indices.extend(matrix_non_zero_indices(linearity).into_iter());
+    
     let mut vars = variables!();
-    let dim = to_test.len();
-    let mut x: Vec<good_lp::Variable> = Vec::with_capacity(dim);
-    for _i in 0..dim {
-        x.push(vars.add_variable());
+    let dim = non_zero_indices.len();
+    debug!("LP separation problem has {} variables", dim);
+    let mut x: HashMap<usize, good_lp::Variable> = HashMap::with_capacity(dim);
+    for i in non_zero_indices {
+        x.insert(i, vars.add_variable());
     }
     let d = vars.add_variable();
 
@@ -123,9 +139,11 @@ fn lp_separation(
     let solution = problem.solve()?;
     let maxima = solution.eval(&objective);
     let sep_solution = if maxima > EPSILON {
-        let mut cert: Vec<f64> = Vec::with_capacity(x.len());
-        cert.push(solution.value(d));
-        cert.extend(x.iter().map(|variable| solution.value(*variable)));
+        let mut cert: Vec<f64> = vec![0f64; to_test.len() + 1];
+        cert[0] = solution.value(d);
+        for (index, variable) in x{
+            cert[index] = solution.value(variable);
+        }
         EssentialSolution::Essential(Array1::<f64>::from(cert))
     } else {
         EssentialSolution::Redundant
@@ -152,7 +170,11 @@ fn lp_interior_point(
     let objective = x.first().ok_or(anyhow!("No variables!"))?;
     let mut problem = vars.maximise(objective).using(default_solver);
     for (row, b_val) in constraints.axis_iter(Axis(0)).zip_eq(vector_b) {
-        let constraint = inner_product_lp(&row, &x);
+        let constraint: Expression = row.iter().zip_eq(&x).filter_map(|(coeff, variable)| if coeff.abs() > EPSILON {
+            Some(*coeff * *variable)
+        }else{
+            None
+        }).sum();
         problem = problem.with(constraint!(constraint <= (*b_val - EPSILON)));
     }
 
